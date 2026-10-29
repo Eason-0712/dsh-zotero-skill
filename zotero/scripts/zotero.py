@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import json
+import math
 import os
 import platform
 import re
@@ -23,6 +24,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -758,6 +760,645 @@ def cmd_import_records(args: argparse.Namespace, kind: str) -> None:
     dump_json({"status": response.status, "session": session, "response": parse_body(response)})
 
 
+# ---------------------------------------------------------------------------
+# Daily discovery: OpenAlex metadata -> ranked candidates -> Connector import
+# ---------------------------------------------------------------------------
+
+DEFAULT_DAILY_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "max_items": 10,
+    "days_back": 7,
+    "topics": [],
+    "include_preprints": False,
+    "min_venue_score": 0.0,
+    "max_per_venue": 3,
+    "weights": {"venue": 0.45, "citations": 0.30, "relevance": 0.15, "recency": 0.10},
+    "mailto": "",
+    "schedule_time": "08:00",
+}
+MAX_DAILY_ITEMS = 30
+DAILY_TASK_NAME = "DSH-Zotero-Daily"
+OPENALEX_BASE = "https://api.openalex.org"
+
+
+def skill_config_dir() -> Path:
+    override = os.environ.get("ZOTERO_SKILL_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".zotero-skill"
+
+
+def daily_config_path() -> Path:
+    return skill_config_dir() / "config.json"
+
+
+def daily_state_path() -> Path:
+    return skill_config_dir() / "state.json"
+
+
+def clamp_int(value: Any, low: int, high: int, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
+def load_daily_config() -> dict[str, Any]:
+    config = json.loads(json.dumps(DEFAULT_DAILY_CONFIG))
+    path = daily_config_path()
+    if path.is_file():
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            exit_with(f"Cannot read {path}: {exc}")
+        if isinstance(stored, dict):
+            for key, value in stored.items():
+                if key == "weights" and isinstance(value, dict):
+                    config["weights"].update(value)
+                elif key in DEFAULT_DAILY_CONFIG:
+                    config[key] = value
+    config["max_items"] = clamp_int(config.get("max_items"), 1, MAX_DAILY_ITEMS, 10)
+    config["days_back"] = clamp_int(config.get("days_back"), 1, 30, 7)
+    config["max_per_venue"] = clamp_int(config.get("max_per_venue"), 1, MAX_DAILY_ITEMS, 3)
+    if not isinstance(config.get("topics"), list):
+        config["topics"] = []
+    config["topics"] = [str(topic).strip() for topic in config["topics"] if str(topic).strip()]
+    return config
+
+
+def save_daily_config(config: dict[str, Any]) -> Path:
+    path = daily_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def load_daily_state() -> dict[str, Any]:
+    path = daily_state_path()
+    if not path.is_file():
+        return {"seen": {}}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"seen": {}}
+    if not isinstance(state, dict) or not isinstance(state.get("seen"), dict):
+        return {"seen": {}}
+    return state
+
+
+def save_daily_state(state: dict[str, Any]) -> Path:
+    path = daily_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - 90 * 86400
+    seen: dict[str, str] = {}
+    for key, stamp in state.get("seen", {}).items():
+        try:
+            when = time.mktime(time.strptime(str(stamp)[:10], "%Y-%m-%d"))
+        except ValueError:
+            when = time.time()
+        if when >= cutoff:
+            seen[key] = stamp
+    state["seen"] = seen
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def openalex_get(
+    path: str,
+    params: dict[str, Any],
+    mailto: str = "",
+    *,
+    optional: bool = False,
+    attempts: int = 3,
+) -> dict[str, Any]:
+    payload = {key: value for key, value in params.items() if value is not None}
+    if mailto:
+        payload["mailto"] = mailto
+    url = OPENALEX_BASE + path + "?" + urllib.parse.urlencode(payload)
+    request_headers = {
+        "User-Agent": "dsh-zotero-skill/0.2 (+https://github.com/Eason-0712/dsh-zotero-skill)"
+    }
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, headers=request_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+    if optional:
+        print(f"OpenAlex request failed ({path}): {last_error}", file=sys.stderr)
+        return {}
+    exit_with(f"OpenAlex request failed ({path}): {last_error}")
+
+
+def fetch_openalex_works(
+    topic: str,
+    start_date: str,
+    end_date: str,
+    *,
+    include_preprints: bool = False,
+    mailto: str = "",
+    pages: int = 1,
+) -> list[dict[str, Any]]:
+    types = "article|review|preprint" if include_preprints else "article|review"
+    results: list[dict[str, Any]] = []
+    for page in range(1, pages + 1):
+        payload = openalex_get(
+            "/works",
+            {
+                "filter": (
+                    f"from_publication_date:{start_date},"
+                    f"to_publication_date:{end_date},type:{types}"
+                ),
+                "search": topic,
+                "per-page": 100,
+                "page": page,
+                "select": (
+                    "id,doi,title,publication_date,cited_by_count,primary_location,"
+                    "authorships,open_access,type,relevance_score,abstract_inverted_index"
+                ),
+            },
+            mailto,
+            optional=True,
+        )
+        batch = payload.get("results") or []
+        results.extend(batch)
+        if len(batch) < 100:
+            break
+    return results
+
+
+def fetch_source_metrics(source_ids: list[str], mailto: str = "") -> dict[str, dict[str, Any]]:
+    metrics: dict[str, dict[str, Any]] = {}
+    ids = [
+        re.sub(r"^https?://openalex\.org/", "", str(source_id))
+        for source_id in source_ids
+        if source_id
+    ]
+    for index in range(0, len(ids), 25):
+        chunk = ids[index : index + 25]
+        payload = openalex_get(
+            "/sources",
+            {
+                "filter": "openalex_id:" + "|".join(chunk),
+                "per-page": 50,
+                "select": "id,display_name,summary_stats,issn_l",
+            },
+            mailto,
+            optional=True,
+        )
+        for source in payload.get("results") or []:
+            metrics[source.get("id", "")] = source
+    return metrics
+
+
+def parse_iso_date(value: Any) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def rebuild_abstract(inverted: Any) -> str:
+    if not isinstance(inverted, dict):
+        return ""
+    slots: list[tuple[int, str]] = []
+    for word, positions in inverted.items():
+        for position in positions or []:
+            try:
+                slots.append((int(position), str(word)))
+            except (TypeError, ValueError):
+                continue
+    slots.sort(key=lambda row: row[0])
+    return " ".join(word for _, word in slots)
+
+
+def normalize_text(value: Any) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", text)
+    return " ".join(text.split())
+
+
+def normalize_doi(value: Any) -> str:
+    doi = str(value or "").strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        if doi.startswith(prefix):
+            doi = doi[len(prefix) :]
+    return doi
+
+
+def normalize_ceiling(value: float, ceiling: float) -> float:
+    if value <= 0:
+        return 0.0
+    return min(1.0, math.log1p(value) / math.log1p(ceiling))
+
+
+def score_candidate(
+    work: dict[str, Any],
+    venue_stats: dict[str, dict[str, Any]],
+    weights: dict[str, float],
+    today: date | None = None,
+) -> dict[str, Any]:
+    today = today or date.today()
+    published = parse_iso_date(work.get("publication_date")) or today
+    age_days = max(0, (today - published).days)
+    source = (work.get("primary_location") or {}).get("source") or {}
+    stats = (venue_stats.get(source.get("id", "")) or {}).get("summary_stats") or {}
+    venue_raw = float(stats.get("2yr_mean_citedness") or 0.0)
+    citations = int(work.get("cited_by_count") or 0)
+    years = max(age_days / 365.25, 0.08)
+    cites_per_year = citations / years
+    relevance = float(work.get("relevance_score") or 0.0)
+
+    venue_norm = normalize_ceiling(venue_raw, 20.0)
+    cite_norm = normalize_ceiling(cites_per_year, 10.0)
+    rel_norm = min(1.0, max(0.0, relevance / 100.0))
+    recency = math.exp(-age_days / 14.0)
+
+    score = (
+        float(weights.get("venue", 0.0)) * venue_norm
+        + float(weights.get("citations", 0.0)) * cite_norm
+        + float(weights.get("relevance", 0.0)) * rel_norm
+        + float(weights.get("recency", 0.0)) * recency
+    )
+    authors = [
+        str((entry.get("author") or {}).get("display_name") or "").strip()
+        for entry in work.get("authorships") or []
+    ]
+    authors = [author for author in authors if author]
+    title = str(work.get("title") or "").strip()
+    doi = normalize_doi(work.get("doi"))
+    return {
+        "id": work.get("id"),
+        "doi": doi,
+        "title": title,
+        "published": published.isoformat(),
+        "venue": str(source.get("display_name") or "").strip(),
+        "venue_score": round(venue_raw, 2),
+        "citations": citations,
+        "authors": authors,
+        "abstract": rebuild_abstract(work.get("abstract_inverted_index")),
+        "score": round(score, 4),
+        "metrics": {
+            "venue": round(venue_norm, 3),
+            "citations": round(cite_norm, 3),
+            "relevance": round(rel_norm, 3),
+            "recency": round(recency, 3),
+        },
+    }
+
+
+def library_has_item(title: str, doi: str) -> bool:
+    words = " ".join(normalize_text(title).split()[:6])
+    if not words:
+        return False
+    try:
+        params = query({"q": words, "limit": 10})
+        items = api_get(f"{LOCAL_USER}/items/top?{params}")
+    except SystemExit:
+        return False
+    target = normalize_text(title)
+    for item in items:
+        data = item.get("data", item)
+        if normalize_text(data.get("title")) == target:
+            return True
+        if doi and normalize_doi(data.get("DOI") or data.get("doi")) == doi:
+            return True
+    return False
+
+
+def bibtex_key_for(candidate: dict[str, Any], index: int = 0) -> str:
+    authors = candidate.get("authors") or []
+    surname = "anon"
+    if authors:
+        parts = normalize_text(authors[0]).split()
+        if parts:
+            surname = re.sub(r"[^a-z0-9]", "", parts[-1]) or "anon"
+    year = str(candidate.get("published") or "")[:4] or "n"
+    words = [word for word in normalize_text(candidate.get("title")).split() if len(word) > 2]
+    word = re.sub(r"[^a-z0-9]", "", words[0]) if words else "paper"
+    suffix = "" if index == 0 else chr(ord("a") + index)
+    return f"{surname}{year}{word or 'paper'}{suffix}"
+
+
+def escape_bibtex(value: str) -> str:
+    text = " ".join(str(value).split())
+    return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+
+def build_bibtex_entry(candidate: dict[str, Any], index: int = 0) -> str:
+    doi = candidate.get("doi") or ""
+    fields = [
+        ("title", candidate.get("title") or ""),
+        ("author", " and ".join(candidate.get("authors") or [])),
+        ("journal", candidate.get("venue") or ""),
+        ("year", str(candidate.get("published") or "")[:4]),
+        ("doi", doi),
+        ("url", f"https://doi.org/{doi}" if doi else ""),
+        ("abstract", candidate.get("abstract") or ""),
+    ]
+    body = ",\n".join(
+        f"  {name} = {{{escape_bibtex(value)}}}" for name, value in fields if value
+    )
+    return f"@article{{{bibtex_key_for(candidate, index)},\n{body}\n}}"
+
+
+def parse_topics(raw: str) -> list[str]:
+    separator = ";" if ";" in raw else ","
+    topics = [part.strip() for part in raw.split(separator)]
+    return [topic for topic in topics if topic]
+
+
+def collect_daily_candidates(config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    today = date.today()
+    start = today - timedelta(days=config["days_back"])
+    mailto = config.get("mailto") or ""
+    works: list[dict[str, Any]] = []
+    for topic in config["topics"]:
+        works.extend(
+            fetch_openalex_works(
+                topic,
+                start.isoformat(),
+                today.isoformat(),
+                include_preprints=bool(config.get("include_preprints")),
+                mailto=mailto,
+            )
+        )
+
+    if not works:
+        exit_with("No candidates returned from OpenAlex; check topics, network, or days_back")
+
+    state = load_daily_state()
+    seen = state.get("seen", {})
+    unique: dict[str, dict[str, Any]] = {}
+    for work in works:
+        key = normalize_doi(work.get("doi")) or str(work.get("id") or "")
+        if key and key not in seen:
+            unique.setdefault(key, work)
+
+    source_ids = [
+        ((work.get("primary_location") or {}).get("source") or {}).get("id", "")
+        for work in unique.values()
+    ]
+    cache = state.get("venues") if isinstance(state.get("venues"), dict) else {}
+    stale = []
+    for source_id in {sid for sid in source_ids if sid}:
+        entry = cache.get(source_id) or {}
+        try:
+            cached_on = date.fromisoformat(str(entry.get("date"))[:10])
+        except ValueError:
+            cached_on = None
+        if cached_on is None or (today - cached_on).days >= 30:
+            stale.append(source_id)
+    for source_id, source in fetch_source_metrics(stale, mailto).items():
+        cache[source_id] = {
+            "date": today.isoformat(),
+            "display_name": source.get("display_name"),
+            "summary_stats": source.get("summary_stats") or {},
+        }
+    if stale and any(cache.get(sid) for sid in stale):
+        state["venues"] = cache
+        save_daily_state(state)
+    venue_stats = {
+        source_id: {
+            "summary_stats": (cache.get(source_id) or {}).get("summary_stats") or {},
+            "display_name": (cache.get(source_id) or {}).get("display_name"),
+        }
+        for source_id in source_ids
+        if source_id
+    }
+
+    candidates: list[dict[str, Any]] = []
+    skipped = {"seen": len(works) - len(unique), "low_venue": 0, "in_library": 0}
+    api_up = request("/api/", timeout=2).ok
+    for key, work in unique.items():
+        candidate = score_candidate(work, venue_stats, config.get("weights") or {}, today)
+        candidate["dedup_key"] = key
+        if not candidate["title"]:
+            continue
+        if candidate["venue_score"] < float(config.get("min_venue_score") or 0):
+            skipped["low_venue"] += 1
+            continue
+        if api_up and library_has_item(candidate["title"], candidate["doi"]):
+            skipped["in_library"] += 1
+            continue
+        candidates.append(candidate)
+
+    candidates.sort(key=lambda row: row["score"], reverse=True)
+    return candidates, skipped
+
+
+def select_candidates(
+    candidates: list[dict[str, Any]], max_items: int, max_per_venue: int = 3
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    overflow: list[dict[str, Any]] = []
+    per_venue: dict[str, int] = {}
+    for candidate in candidates:
+        venue = str(candidate.get("venue") or "")
+        if venue and per_venue.get(venue, 0) >= max_per_venue:
+            overflow.append(candidate)
+            continue
+        selected.append(candidate)
+        per_venue[venue] = per_venue.get(venue, 0) + 1
+        if len(selected) >= max_items:
+            return selected
+    for candidate in overflow:
+        if len(selected) >= max_items:
+            break
+        selected.append(candidate)
+    return selected
+
+
+def cmd_daily(args: argparse.Namespace) -> None:
+    config = load_daily_config()
+    if args.max is not None:
+        config["max_items"] = clamp_int(args.max, 1, MAX_DAILY_ITEMS, config["max_items"])
+    if args.days is not None:
+        config["days_back"] = clamp_int(args.days, 1, 30, config["days_back"])
+    if getattr(args, "max_per_venue", None) is not None:
+        config["max_per_venue"] = clamp_int(
+            args.max_per_venue, 1, MAX_DAILY_ITEMS, config["max_per_venue"]
+        )
+    if not config["enabled"] and not args.force:
+        dump_json(
+            {
+                "enabled": False,
+                "hint": "Enable with: zotero.py daily-config --enable",
+                "config_path": str(daily_config_path()),
+            }
+        )
+        return
+    if not config["topics"]:
+        exit_with('No topics configured. Run: zotero.py daily-config --topics "topic one;topic two"')
+
+    candidates, skipped = collect_daily_candidates(config)
+    selected = select_candidates(
+        candidates, config["max_items"], int(config.get("max_per_venue") or 3)
+    )
+    payload: dict[str, Any] = {
+        "enabled": True,
+        "dry_run": bool(args.dry_run),
+        "days_back": config["days_back"],
+        "max_items": config["max_items"],
+        "candidates": len(candidates),
+        "skipped": skipped,
+        "items": selected,
+    }
+    if args.dry_run or not selected:
+        payload["imported"] = 0
+        dump_json(payload)
+        return
+
+    if not request("/connector/ping", timeout=2).ok and not request("/api/", timeout=2).ok:
+        restart_zotero(wait_for_api=True)
+    if not request("/connector/ping", timeout=5).ok:
+        exit_with("Zotero connector is not reachable; start Zotero and retry")
+
+    bibtex = "\n\n".join(build_bibtex_entry(item, index) for index, item in enumerate(selected))
+    session = f"dsh-daily-{uuid.uuid4().hex}"
+    path = f"/connector/import?{query({'session': session})}"
+    response = require_ok(connector_post(path, bibtex, content_type="text/plain"), f"POST {path}")
+
+    state = load_daily_state()
+    today = date.today().isoformat()
+    for item in selected:
+        state["seen"][item["dedup_key"]] = today
+    state_path = save_daily_state(state)
+
+    payload.update(
+        {
+            "imported": len(selected),
+            "session": session,
+            "response": parse_body(response),
+            "state_path": str(state_path),
+        }
+    )
+    dump_json(payload)
+
+
+def cmd_daily_config(args: argparse.Namespace) -> None:
+    config = load_daily_config()
+    changed = False
+    if args.enable:
+        config["enabled"] = True
+        changed = True
+    if args.disable:
+        config["enabled"] = False
+        changed = True
+    if args.max is not None:
+        config["max_items"] = clamp_int(args.max, 1, MAX_DAILY_ITEMS, config["max_items"])
+        changed = True
+    if args.days is not None:
+        config["days_back"] = clamp_int(args.days, 1, 30, config["days_back"])
+        changed = True
+    if args.max_per_venue is not None:
+        config["max_per_venue"] = clamp_int(
+            args.max_per_venue, 1, MAX_DAILY_ITEMS, config["max_per_venue"]
+        )
+        changed = True
+    if args.topics is not None:
+        config["topics"] = parse_topics(args.topics)
+        changed = True
+    if args.mailto is not None:
+        config["mailto"] = args.mailto.strip()
+        changed = True
+    if args.include_preprints:
+        config["include_preprints"] = True
+        changed = True
+    if args.exclude_preprints:
+        config["include_preprints"] = False
+        changed = True
+    if args.min_venue is not None:
+        config["min_venue_score"] = max(0.0, float(args.min_venue))
+        changed = True
+    if args.time is not None:
+        config["schedule_time"] = args.time
+        changed = True
+
+    if changed:
+        save_daily_config(config)
+    dump_json(
+        {
+            "config_path": str(daily_config_path()),
+            "saved": changed,
+            "config": config,
+        }
+    )
+
+
+def cmd_daily_schedule(args: argparse.Namespace) -> None:
+    if platform.system() != "Windows":
+        exit_with("daily-schedule currently supports Windows Task Scheduler only")
+    config = load_daily_config()
+    name = args.name or DAILY_TASK_NAME
+    if args.remove:
+        result = subprocess.run(
+            ["schtasks", "/Delete", "/F", "/TN", name],
+            capture_output=True,
+            text=True,
+        )
+        dump_json(
+            {
+                "task": name,
+                "removed": result.returncode == 0,
+                "message": (result.stdout or result.stderr).strip(),
+            }
+        )
+        return
+
+    time_text = args.time or str(config.get("schedule_time") or "08:00")
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", time_text):
+        exit_with("Schedule time must look like HH:MM (24-hour), e.g. 08:30")
+
+    config["schedule_time"] = time_text
+    save_daily_config(config)
+
+    wrapper = skill_config_dir() / "daily.cmd"
+    log_path = skill_config_dir() / "daily.log"
+    script = Path(__file__).resolve()
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        f'"{sys.executable}" "{script}" daily >> "{log_path}" 2>&1\r\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "schtasks",
+            "/Create",
+            "/F",
+            "/SC",
+            "DAILY",
+            "/ST",
+            time_text,
+            "/TN",
+            name,
+            "/TR",
+            f'"{wrapper}"',
+        ],
+        capture_output=True,
+        text=True,
+    )
+    dump_json(
+        {
+            "task": name,
+            "created": result.returncode == 0,
+            "time": time_text,
+            "wrapper": str(wrapper),
+            "log": str(log_path),
+            "message": (result.stdout or result.stderr).strip(),
+        }
+    )
+
+
 def add_json_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--json", action="store_true", help="Print JSON instead of a compact text summary"
@@ -892,6 +1533,54 @@ def build_parser() -> argparse.ArgumentParser:
         import_cmd.add_argument("--session")
         import_cmd.add_argument("--yes", action="store_true", help="Confirm Zotero library write")
         import_cmd.set_defaults(func=lambda args, kind=kind: cmd_import_records(args, kind))
+
+    daily = subcommands.add_parser(
+        "daily", help="Fetch new papers for your topics and import the best ones into Zotero"
+    )
+    daily.add_argument(
+        "--dry-run", action="store_true", help="Only rank candidates; do not write to Zotero"
+    )
+    daily.add_argument(
+        "--force", action="store_true", help="Run even when the daily feature is disabled"
+    )
+    daily.add_argument("--max", type=int, help=f"Papers to import this run (1-{MAX_DAILY_ITEMS})")
+    daily.add_argument("--days", type=int, help="Look back this many days (1-30)")
+    daily.add_argument(
+        "--max-per-venue", type=int, help="At most this many papers from the same venue"
+    )
+    daily.set_defaults(func=cmd_daily)
+
+    daily_config = subcommands.add_parser(
+        "daily-config", help="Show or change daily discovery settings"
+    )
+    toggle = daily_config.add_mutually_exclusive_group()
+    toggle.add_argument("--enable", action="store_true", help="Turn daily discovery on")
+    toggle.add_argument("--disable", action="store_true", help="Turn daily discovery off")
+    daily_config.add_argument("--max", type=int, help=f"Max papers per run (1-{MAX_DAILY_ITEMS})")
+    daily_config.add_argument("--days", type=int, help="Look back this many days (1-30)")
+    daily_config.add_argument(
+        "--max-per-venue", type=int, help="At most this many papers from the same venue"
+    )
+    daily_config.add_argument(
+        "--topics", help='Research topics separated by ";" e.g. "transformer;large language model"'
+    )
+    daily_config.add_argument("--mailto", help="Contact email for the OpenAlex polite pool")
+    preprints = daily_config.add_mutually_exclusive_group()
+    preprints.add_argument("--include-preprints", action="store_true")
+    preprints.add_argument("--exclude-preprints", action="store_true")
+    daily_config.add_argument(
+        "--min-venue", type=float, help="Minimum venue 2-year mean citedness (raw value)"
+    )
+    daily_config.add_argument("--time", help="Default schedule time, HH:MM (24-hour)")
+    daily_config.set_defaults(func=cmd_daily_config)
+
+    daily_schedule = subcommands.add_parser(
+        "daily-schedule", help="Create or remove a Windows scheduled task for daily discovery"
+    )
+    daily_schedule.add_argument("--time", help="Run time, HH:MM (24-hour), default from config")
+    daily_schedule.add_argument("--name", help=f"Task name, default {DAILY_TASK_NAME}")
+    daily_schedule.add_argument("--remove", action="store_true", help="Delete the scheduled task")
+    daily_schedule.set_defaults(func=cmd_daily_schedule)
 
     return parser
 

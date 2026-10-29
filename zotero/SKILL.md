@@ -1,6 +1,6 @@
 ---
 name: zotero
-description: 操作本机 Zotero 文献库：检索论文、导出 BibTeX、为 LaTeX 或 Markdown 草稿添加引用，以及按需读取附件全文或导入 BibTeX/RIS。用户提到 Zotero、文献库、references.bib 或从文献库添加引用时使用。
+description: 操作本机 Zotero 文献库：检索论文、导出 BibTeX、为 LaTeX 或 Markdown 草稿添加引用、按需读取附件全文、导入 BibTeX/RIS，以及按主题每日自动收录新论文。用户提到 Zotero、文献库、references.bib、从文献库添加引用或每日文献推送时使用。
 ---
 
 # Zotero · DeepSeek Harness
@@ -67,5 +67,25 @@ LaTeX 输出 `\cite{key}`，Markdown 输出 Pandoc 格式 `[@key]`。脚本会�
 <python> "<skill-dir>/scripts/zotero.py" import-bibtex --file new.bib --yes
 <python> "<skill-dir>/scripts/zotero.py" import-ris --file new.ris --yes
 ```
+
+## 每日自动收录
+
+`daily` 从 OpenAlex 抓取最近 N 天、按主题检索的论文，按期刊 2 年平均被引、年化引用速度、相关度和新鲜度打分，去重后把排名靠前的论文通过 Connector 导入当前选中的 Zotero 分类。OpenAlex 免费、无需 API Key，但需要网络。
+
+```text
+<python> "<skill-dir>/scripts/zotero.py" daily-config --enable --topics "transformer;large language model" --max 10 --mailto "you@example.com"
+<python> "<skill-dir>/scripts/zotero.py" daily --dry-run
+<python> "<skill-dir>/scripts/zotero.py" daily
+<python> "<skill-dir>/scripts/zotero.py" daily-schedule --time 08:00
+```
+
+- 每次最多 30 篇（`--max`），同一期刊默认最多 3 篇（`--max-per-venue`），回溯天数默认 7（`--days`）。
+- 是否启用由用户决定：`daily-config --enable` / `--disable`；未启用时 `daily` 只返回提示，`--force` 可临时运行。
+- 导入前先在 Zotero 中选中目标分类；导入是写库操作，先让用户确认主题、数量和目标分类。
+- 定时任务用 Windows 任务计划程序，只在该用户登录时运行；Zotero 未启动时脚本会尝试启动并等待。
+- `daily --dry-run` 只排序不写库，适合先给用户看候选名单。
+- 配置与去重状态在 `~/.zotero-skill/`（`config.json`、`state.json`），可用 `ZOTERO_SKILL_CONFIG_DIR` 改位置。
+- 指标是 OpenAlex 的期刊 2 年平均被引与引用速度，不是 JCR 影响因子；不要把分数说成“影响因子”。
+- v1 只导入题录与摘要，不下载 PDF；附件仍需用户按需获取。
 
 需要路由细节时再读 [references/local-api-routes.md](references/local-api-routes.md)。本地 API 只读，导入使用 Connector；不要直接写 Zotero SQLite 数据库。

@@ -120,3 +120,56 @@ class ZoteroTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class DailyDiscoveryTests(unittest.TestCase):
+    def make_work(self, title, venue_id, cites=0, published='2026-10-28', relevance=80.0):
+        return {
+            'id': 'https://openalex.org/W1',
+            'doi': 'https://doi.org/10.1000/XYZ',
+            'title': title,
+            'publication_date': published,
+            'cited_by_count': cites,
+            'primary_location': {'source': {'id': venue_id, 'display_name': 'Journal'}},
+            'authorships': [{'author': {'display_name': 'Ada Lovelace'}}],
+            'relevance_score': relevance,
+        }
+
+    def test_score_prefers_high_impact_venue(self):
+        weights = {'venue': 0.5, 'citations': 0.3, 'relevance': 0.1, 'recency': 0.1}
+        metrics = {'https://openalex.org/S1': {'summary_stats': {'2yr_mean_citedness': 19.0}}}
+        top = z.score_candidate(self.make_work('A', 'https://openalex.org/S1'), metrics, weights)
+        low = z.score_candidate(self.make_work('B', 'https://openalex.org/S2'), metrics, weights)
+        self.assertGreater(top['score'], low['score'])
+        self.assertGreater(top['venue_score'], low['venue_score'])
+
+    def test_select_candidates_caps_per_venue(self):
+        rows = [{'venue': 'A', 'score': 5 - i} for i in range(3)] + [
+            {'venue': 'B', 'score': 2}, {'venue': 'B', 'score': 1}
+        ]
+        picked = z.select_candidates(rows, 3, 2)
+        self.assertEqual(len(picked), 3)
+        self.assertEqual(sum(1 for row in picked if row['venue'] == 'A'), 2)
+
+    def test_bibtex_entry_escapes_braces(self):
+        candidate = {
+            'title': 'A {B} study',
+            'authors': ['Ada Lovelace', 'Alan Turing'],
+            'venue': 'Journal',
+            'published': '2026-10-28',
+            'doi': '10.1000/xyz',
+            'abstract': 'line1\nline2',
+        }
+        entry = z.build_bibtex_entry(candidate)
+        self.assertIn('\\{B\\}', entry)
+        self.assertIn('Ada Lovelace and Alan Turing', entry)
+        self.assertIn('10.1000/xyz', entry)
+        self.assertTrue(entry.startswith('@article{lovelace2026'))
+
+    def test_normalize_doi_and_abstract(self):
+        self.assertEqual(z.normalize_doi('https://doi.org/10.1/ABC'), '10.1/abc')
+        abstract = z.rebuild_abstract({'hello': [0], 'world': [1]})
+        self.assertEqual(abstract, 'hello world')
+
+    def test_clamp_int_bounds(self):
+        self.assertEqual(z.clamp_int(99, 1, 30, 10), 30)
+        self.assertEqual(z.clamp_int('bad', 1, 30, 7), 7)
