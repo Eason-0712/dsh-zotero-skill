@@ -1,0 +1,48 @@
+{
+  "name": "dsh-zotero-skill",
+  "version": "0.2.0",
+  "description": "Zotero skill for DeepSeek Harness: search the local library, export BibTeX, cite into LaTeX/Markdown drafts, and import a ranked daily digest of new papers from OpenAlex.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "zotero/**",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Eason-0712/dsh-zotero-skill.git"
+  },
+  "homepage": "https://github.com/Eason-0712/dsh-zotero-skill#readme",
+  "bugs": {
+    "url": "https://github.com/Eason-0712/dsh-zotero-skill/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "zotero",
+    "skill",
+    "bibtex",
+    "citation"
+  ]
+}

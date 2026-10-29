@@ -27,9 +27,27 @@
 - 桌面版 Zotero（开发时验证于 Zotero 10.0.6）
 - DeepSeek Harness
 
-### 2. 放进 skill 目录
+### 2. 装进 Harness
 
-用户级（所有工作区可用）：
+两种方式，任选其一。
+
+**方式 A：作为 DSH 插件安装（推荐）**
+
+仓库自带 `dsh.bundle` 清单，装成插件后 skill 自动出现在技能目录，不需要复制文件：
+
+```bash
+dsh plugin --profile <你的 profile> add github:Eason-0712/dsh-zotero-skill
+```
+
+也可以从本地检出安装（开发调试用）：
+
+```bash
+dsh plugin --profile <你的 profile> add "link:/path/to/dsh-zotero-skill"
+```
+
+卸载：`dsh plugin --profile <你的 profile> remove dsh-zotero-skill`。
+
+**方式 B：作为独立 skill 目录安装**
 
 ```text
 # 仓库根目录下执行
@@ -167,17 +185,23 @@ python zotero/scripts/zotero.py daily-schedule --remove
 
 ```text
 .
+├── package.json                     # dsh.bundle 清单，dsh plugin add 靠它识别
+├── cordis.patch.yml                 # 插件挂载行
+├── lib/index.js                     # 向 ctx.skills 注册内置 skill 的 provider
 ├── zotero/
 │   ├── SKILL.md                     # skill 入口，Harness 读取它来发现技能
 │   ├── references/
 │   │   ├── deepseek-harness.md      # 安装、连接排查、环境变量
 │   │   └── local-api-routes.md      # 本地 API 与 Connector 路由
 │   └── scripts/zotero.py            # 全部功能，仅标准库
-├── tests/test_zotero.py             # 模拟 API 的单元测试
-├── install.py                       # 安装器
+├── test/provider.test.mjs           # provider 的 Node 测试
+├── tests/test_zotero.py             # 模拟 API 的 Python 单元测试
+├── install.py                       # 复制式安装器（方式 B）
 ├── LICENSE
 └── NOTICE.md
 ```
+
+装成插件后，`lib/index.js` 在 `apply()` 里注册一个 rank 600 的 provider，直接读包内的 `zotero/SKILL.md`。相比复制到 `~/.dsh/skills`，升级只需 `dsh plugin` 更新，也不会有两份副本不同步的问题。
 
 ## 设计取舍
 
@@ -190,10 +214,11 @@ python zotero/scripts/zotero.py daily-schedule --remove
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v   # Python 侧
+node --test test/*.test.mjs               # 插件 provider
 ```
 
-测试用临时文件和模拟 API，不读写真实文献库。GitHub Actions 会在 Ubuntu / Windows 与 Python 3.10 / 3.13 上运行同一套测试。
+测试用临时文件和模拟 API，不读写真实文献库。GitHub Actions 会在 Ubuntu / Windows 与 Python 3.10 / 3.13 上跑 Python 测试，并在 Node 20 / 22 上跑 provider 测试。
 
 ## 已知限制
 

@@ -1,0 +1,20 @@
+# dsh-zotero-skill bundle patch
+#
+# This row mounts one host plugin (lib/index.js). On apply() it registers a
+# skill provider on ctx.skills that serves zotero/SKILL.md from inside this
+# package, so the skill appears in the agent catalog as soon as the plugin is
+# installed — no copy into ~/.dsh/skills or ~/.agents/skills.
+#
+# Install:
+#   dsh plugin --profile <name> add github:Eason-0712/dsh-zotero-skill
+#
+# Local development (link to a checkout):
+#   dsh plugin --profile <name> add "link:D:\code\dsh-zotero-skill"
+#
+# Remove:
+#   dsh plugin --profile <name> remove dsh-zotero-skill
+#
+# The inserted `name` must match the installed package name exactly.
+- insert:
+    - id: dsh-zotero-skill
+      name: dsh-zotero-skill
