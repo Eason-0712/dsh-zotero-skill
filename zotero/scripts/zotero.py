@@ -1555,6 +1555,15 @@ def load_local_key() -> dict[str, Any]:
     return stored if isinstance(stored, dict) else {}
 
 
+def authorize_timeout() -> float:
+    """How long to wait for the user to click Allow in Zotero."""
+    try:
+        value = float(os.environ.get("ZOTERO_AUTHORIZE_TIMEOUT", "900"))
+    except ValueError:
+        value = 900.0
+    return max(30.0, value)
+
+
 def authorize_zotero(app_name: str = WRITE_APP_NAME) -> dict[str, Any]:
     sid = server_id()
     payload = json.dumps({"appName": app_name}).encode("utf-8")
@@ -1565,7 +1574,7 @@ def authorize_zotero(app_name: str = WRITE_APP_NAME) -> dict[str, Any]:
     }
     print(
         "Zotero is asking for permission: choose \"Always Allow\" / 「始终允许」 "
-        f"for {app_name}.",
+        f"for {app_name}. Waiting up to {int(authorize_timeout())}s.",
         file=sys.stderr,
     )
     response = request(
@@ -1573,7 +1582,7 @@ def authorize_zotero(app_name: str = WRITE_APP_NAME) -> dict[str, Any]:
         method="POST",
         data=payload,
         headers=headers,
-        timeout=300.0,
+        timeout=authorize_timeout(),
     )
     if not response.ok:
         detail = response.error or response.text[:TEXT_LIMIT] or "no response body"
@@ -1689,6 +1698,26 @@ def find_collection(name: str) -> dict[str, Any] | None:
     return None
 
 
+def created_key(body: Any) -> str | None:
+    """Extract the new object key from a multi-write response.
+
+    Zotero keys the `successful` map by request index ("0"), not by object key,
+    so the key has to be read from the entry body.
+    """
+    if not isinstance(body, dict):
+        return None
+    created = body.get("successful") or {}
+    if not isinstance(created, dict) or not created:
+        return None
+    token = next(iter(created))
+    entry = created[token]
+    if isinstance(entry, dict) and entry.get("key"):
+        return str(entry["key"])
+    if re.fullmatch(r"[0-9A-Za-z]{8}", str(token)):
+        return str(token)
+    return None
+
+
 def create_collection(name: str, parent: str | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {"name": name}
     if parent:
@@ -1697,14 +1726,12 @@ def create_collection(name: str, parent: str | None = None) -> dict[str, Any]:
             exit_with(f"Parent collection not found: {parent}")
         data = parent_record.get("data", parent_record)
         payload["parentCollection"] = parent_record.get("key") or data.get("key")
-    response = local_write(f"{LOCAL_USER}/collections", payload, method="POST")
+    else:
+        payload["parentCollection"] = False
+    response = local_write(f"{LOCAL_USER}/collections", [payload], method="POST")
     require_ok(response, "POST collection")
-    body = parse_body(response)
-    created = (body or {}).get("successful") or {}
-    if isinstance(created, dict) and created:
-        key = next(iter(created))
-        return {"key": key, "data": {"name": name}}
-    return {"key": None, "data": {"name": name}}
+    key = created_key(parse_body(response))
+    return {"key": key, "data": {"name": name}}
 
 
 # --- selection & records ----------------------------------------------------
@@ -2322,6 +2349,262 @@ def cmd_collect(args: argparse.Namespace) -> None:
     )
 
 
+# --- classification into collections (Zotero folders) -----------------------
+
+DIMENSION_LABELS = {
+    "method": "方法",
+    "dataset": "数据集",
+    "type": "类型",
+    "year": "年份",
+    "venue": "期刊",
+    "topic": "主题",
+    "project": "项目",
+}
+
+DOCUMENT_TYPE_LABELS = {
+    "journalArticle": "期刊论文",
+    "conferencePaper": "会议论文",
+    "preprint": "预印本",
+    "thesis": "学位论文",
+    "book": "图书",
+    "bookSection": "图书章节",
+    "report": "报告",
+    "manuscript": "手稿",
+    "dataset": "数据集",
+    "webpage": "网页",
+}
+
+REVIEW_TITLE_RE = re.compile(
+    r"\b(review|survey|overview|tutorial|state[- ]of[- ]the[- ]art|systematic review|meta[- ]analysis)\b",
+    re.IGNORECASE,
+)
+
+DIMENSION_ALIASES = {
+    "method": "method",
+    "methods": "method",
+    "technique": "method",
+    "techniques": "method",
+    "dataset": "dataset",
+    "datasets": "dataset",
+    "data": "dataset",
+    "type": "type",
+    "types": "type",
+    "kind": "type",
+    "kinds": "type",
+    "document": "type",
+    "documents": "type",
+    "year": "year",
+    "years": "year",
+    "venue": "venue",
+    "venues": "venue",
+    "journal": "venue",
+    "journals": "venue",
+    "topic": "topic",
+    "topics": "topic",
+    "project": "project",
+    "projects": "project",
+}
+
+UNCLASSIFIED = "未标注"
+
+
+def dimension_values(record: dict[str, Any], dimension: str) -> list[str]:
+    """Return the folder names this record belongs to for one dimension."""
+    if dimension == "method":
+        return [str(name) for name in record.get("methods") or []]
+    if dimension == "dataset":
+        return [str(name) for name in record.get("datasets") or []]
+    if dimension == "type":
+        values = [
+            DOCUMENT_TYPE_LABELS.get(
+                str(record.get("itemType") or ""), "其他"
+            )
+        ]
+        if REVIEW_TITLE_RE.search(str(record.get("title") or "")):
+            values.append("综述")
+        return values
+    if dimension == "year":
+        year = record.get("year")
+        return [str(year)] if year else []
+    if dimension == "venue":
+        venue = str(record.get("venue") or "").strip()
+        return [venue[:80]] if venue else []
+    if dimension in ("topic", "project"):
+        prefix = dimension + ":"
+        values = []
+        for tag in record.get("tags") or []:
+            text = str(tag)
+            if text.startswith(prefix):
+                values.append(text[len(prefix):].strip())
+        return [value for value in values if value]
+    return []
+
+
+def parse_dimensions(raw: str | None) -> list[str]:
+    """Turn `method,dataset` into `['method', 'dataset']`, rejecting typos."""
+    dimensions: list[str] = []
+    for item in split_csv(raw):
+        name = DIMENSION_ALIASES.get(item.strip().lower())
+        if name is None:
+            exit_with(
+                f"Unknown classification dimension: {item}. "
+                f"Use one of: {', '.join(DIMENSION_LABELS)}"
+            )
+        if name not in dimensions:
+            dimensions.append(name)
+    return dimensions
+
+
+def collection_plan(
+    records: list[dict[str, Any]],
+    dimensions: list[str],
+    *,
+    root: str = "文献分类",
+    include_unclassified: bool = False,
+) -> list[dict[str, Any]]:
+    """Group records into `root / dimension-label / value` folders."""
+    groups: list[dict[str, Any]] = []
+    for dimension in dimensions:
+        label = DIMENSION_LABELS[dimension]
+        buckets: dict[str, list[str]] = {}
+        empty: list[str] = []
+        for record in records:
+            key = str(record.get("key") or "")
+            values = [value for value in dimension_values(record, dimension) if value]
+            if not values:
+                empty.append(key)
+                continue
+            for value in dict.fromkeys(values):
+                buckets.setdefault(value, []).append(key)
+        for value in sorted(buckets):
+            groups.append(
+                {
+                    "dimension": dimension,
+                    "label": label,
+                    "value": value,
+                    "path": [root, label, value],
+                    "items": list(dict.fromkeys(buckets[value])),
+                }
+            )
+        if include_unclassified and empty:
+            groups.append(
+                {
+                    "dimension": dimension,
+                    "label": label,
+                    "value": UNCLASSIFIED,
+                    "path": [root, label, UNCLASSIFIED],
+                    "items": list(dict.fromkeys(empty)),
+                }
+            )
+    return groups
+
+
+def collection_plan_markdown(
+    groups: list[dict[str, Any]], total: int, *, root: str
+) -> str:
+    folders = len(groups)
+    touched = len({key for group in groups for key in group["items"]})
+    lines = [
+        f"# 分类整理计划 · 文件夹（{total} 篇 → {folders} 个文件夹，覆盖 {touched} 篇）",
+        "",
+        f"根目录：`{root}`，结构为 `{root} / 维度 / 取值`；同一个条目可以同时进多个文件夹。",
+        "",
+        "只预览，不写入。加 `--apply --yes` 才会在 Zotero 里真的建文件夹并归入条目。",
+        "",
+        "| 文件夹 | 篇数 | 示例条目 |",
+        "| --- | --- | --- |",
+    ]
+    for group in groups:
+        sample = ", ".join(f"`{key}`" for key in group["items"][:3])
+        if len(group["items"]) > 3:
+            sample += f" … +{len(group['items']) - 3}"
+        lines.append(
+            "| {path} | {count} | {sample} |".format(
+                path=md_cell(" / ".join(group["path"])),
+                count=len(group["items"]),
+                sample=sample,
+            )
+        )
+    return "\n".join(lines)
+
+
+def collection_index() -> dict[tuple[str, str], str]:
+    """Map (parent key or '', normalized name) -> collection key."""
+    index: dict[tuple[str, str], str] = {}
+    for collection in all_collections():
+        data = collection.get("data", collection)
+        key = collection.get("key") or data.get("key")
+        if not key:
+            continue
+        parent = data.get("parentCollection") or ""
+        index[(str(parent), normalize_text(data.get("name")))] = str(key)
+    return index
+
+
+def create_collection_under(name: str, parent_key: str | None) -> str | None:
+    payload: dict[str, Any] = {"name": name}
+    if parent_key:
+        payload["parentCollection"] = parent_key
+    else:
+        payload["parentCollection"] = False
+    response = local_write(f"{LOCAL_USER}/collections", [payload], method="POST")
+    require_ok(response, f"POST collection {name}")
+    return created_key(parse_body(response))
+
+
+def ensure_collection_path(
+    path: list[str], index: dict[tuple[str, str], str]
+) -> str | None:
+    """Create every missing level of a folder path and return its key."""
+    parent = ""
+    key: str | None = None
+    for name in path:
+        lookup = (str(parent), normalize_text(name))
+        found = index.get(lookup)
+        if found is None:
+            found = create_collection_under(name, parent or None)
+            if not found:
+                exit_with(f"Could not create collection: {name}")
+            index[lookup] = found
+        key = found
+        parent = key
+    return key
+
+
+def apply_collection_plan(
+    groups: list[dict[str, Any]], *, dry_run: bool = False
+) -> list[dict[str, Any]]:
+    """Create the folders, then add each item to the folders it belongs to."""
+    index = collection_index() if not dry_run else {}
+    wanted: dict[str, dict[str, list[str]]] = {}
+    for group in groups:
+        collection_key = None if dry_run else ensure_collection_path(group["path"], index)
+        for item_key in group["items"]:
+            entry = wanted.setdefault(item_key, {"keys": [], "paths": []})
+            if collection_key:
+                entry["keys"].append(collection_key)
+            entry["paths"].append(" / ".join(group["path"]))
+
+    results: list[dict[str, Any]] = []
+    for item_key, entry in wanted.items():
+        current_item = item_full(item_key)
+        data = current_item.get("data", current_item)
+        current = list(data.get("collections") or [])
+        added = [key for key in dict.fromkeys(entry["keys"]) if key not in current]
+        if not added:
+            results.append(
+                {"key": item_key, "changed": False, "collections": entry["paths"]}
+            )
+            continue
+        outcome = patch_item(
+            item_key, {"collections": current + added}, dry_run=dry_run
+        )
+        outcome["changed"] = True
+        outcome["collections"] = entry["paths"]
+        results.append(outcome)
+    return results
+
+
 def classify_plan(
     records: list[dict[str, Any]],
     *,
@@ -2360,6 +2643,50 @@ def cmd_classify(args: argparse.Namespace) -> None:
     records = [record_from_item(item) for item in selected_items(args)]
     if not records:
         exit_with("No items matched the selection")
+
+    dimensions = parse_dimensions(getattr(args, "by", "") or "")
+    if dimensions:
+        root = getattr(args, "root", None) or "文献分类"
+        groups = collection_plan(
+            records,
+            dimensions,
+            root=root,
+            include_unclassified=bool(getattr(args, "include_unclassified", False)),
+        )
+        if not groups:
+            exit_with(
+                "No folder could be derived from these items; "
+                "try another --by dimension or add tags first"
+            )
+        if not args.apply:
+            if args.json:
+                dump_json(
+                    {
+                        "mode": "collections",
+                        "root": root,
+                        "items": len(records),
+                        "folders": len(groups),
+                        "groups": groups,
+                    }
+                )
+                return
+            print(collection_plan_markdown(groups, len(records), root=root))
+            return
+        ensure_yes(args, "create Zotero collections")
+        results = apply_collection_plan(groups, dry_run=args.dry_run)
+        dump_json(
+            {
+                "mode": "collections",
+                "root": root,
+                "items": len(records),
+                "folders": len(groups),
+                "changed": sum(1 for row in results if row.get("changed")),
+                "dryRun": bool(args.dry_run),
+                "results": results,
+            }
+        )
+        return
+
     plan = classify_plan(
         records,
         by_method=not args.no_method,
@@ -3256,6 +3583,22 @@ def build_parser() -> argparse.ArgumentParser:
         "classify", help="Derive method/dataset/venue rules and apply them as tags or collections"
     )
     add_selection_args(classify)
+    classify.add_argument(
+        "--by",
+        default="",
+        help=(
+            "Create Zotero folders by dimension instead of tags: "
+            "method,dataset,year,venue,topic,project (comma separated)"
+        ),
+    )
+    classify.add_argument(
+        "--root", default="文献分类", help="Root folder name used with --by"
+    )
+    classify.add_argument(
+        "--include-unclassified",
+        action="store_true",
+        help="Also put items with no value for that dimension into a 未标注 folder",
+    )
     classify.add_argument("--apply", action="store_true", help="Write the plan to Zotero")
     classify.add_argument("--by-year", action="store_true", help="Also tag year:<YYYY>")
     classify.add_argument("--by-venue", action="store_true", help="Also collect per venue")

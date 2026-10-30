@@ -16,7 +16,7 @@
 - **筛核心论文**：把候选或库内条目分成 核心 / 重要 / 参考 三档，输出可复制的短名单。
 - **管理文献**：批量打标签、归集到分类、按 DOI / 标题查重并清理副本。
 - **批量阅读**：一次为几十篇生成阅读包（元数据 + 摘要 + 章节大纲 + 笔记骨架），不必把原文全塞进上下文。
-- **分类整理**：从题名和摘要识别方法与数据集，生成 `auto:method:*` / `auto:dataset:*` 标签与集合计划，预览后写入。
+- **分类整理**：按你想要的维度（论文类型 / 方法 / 数据集 / 年份 / 期刊 / 主题 / 项目）在 Zotero 里直接建文件夹并归入条目，也可以只生成 `auto:method:*` / `auto:dataset:*` 标签计划，预览后写入。
 - **提炼脉络**：统计年份、期刊、方法、数据集及共现，直接产出综述可用的表格。
 - **发现空白**：按项目分组找「方法 × 数据集」从未交叉的组合、停更标签与标注缺失。
 - **检索与引用**：按关键词搜索条目，返回题名、作者、年份、item key 与 BibTeX key；在草稿唯一标记处插入 `\cite{key}` 或 `[@key]` 并同步 `.bib`。
@@ -187,7 +187,7 @@ python zotero/scripts/zotero.py daily-schedule --remove
 | `screen` | 把候选或库内条目分成 核心 / 重要 / 参考 |
 | `tag` | 批量加 / 删 / 替换标签（`--dry-run`） |
 | `collect <name>` | 归集到分类，不存在则新建 |
-| `classify` | 识别方法与数据集，生成标签/集合计划，`--apply` 写入 |
+| `classify` | 按维度（类型/方法/数据集/年份/期刊/主题/项目）建文件夹并归入，或生成标签计划；`--apply` 写入 |
 | `dupes` | 按 DOI 或标题查重，`--trash` 清理副本 |
 | `digest` | 批量生成阅读包（每篇一个 Markdown + index.md） |
 | `landscape` | 年份 / 期刊 / 方法 / 数据集统计与共现 |
@@ -276,6 +276,6 @@ node --test test/*.test.mjs               # 插件 provider
 
 ## English
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) skill that runs the whole literature loop against your local Zotero library: find papers on OpenAlex, track research fronts with saved watches, screen candidates into core / important / reference tiers, manage items (batch tags, collections, DOI and title de-duplication), generate batch reading packs, classify items by method and dataset, chart the landscape of years / venues / methods / datasets, and surface candidate research gaps. It also exports BibTeX, inserts citations into LaTeX/Markdown drafts, and can run a ranked daily digest of new papers.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) skill that runs the whole literature loop against your local Zotero library: find papers on OpenAlex, track research fronts with saved watches, screen candidates into core / important / reference tiers, manage items (batch tags, collections, DOI and title de-duplication), generate batch reading packs, classify items into Zotero folders by type / method / dataset / year / venue / topic / project, chart the landscape of years / venues / methods / datasets, and surface candidate research gaps. It also exports BibTeX, inserts citations into LaTeX/Markdown drafts, and can run a ranked daily digest of new papers.
 
 Install with `dsh plugin --profile <name> add dsh-zotero-skill` (or copy `zotero/` to `~/.dsh/skills/zotero`, or run `python install.py`), enable Zotero's local API, and run `zotero.py authorize` once if you want write operations. Adapted from OpenAI's Zotero plugin 0.1.2 under the MIT license.

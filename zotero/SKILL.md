@@ -93,7 +93,22 @@ description: 面向科研文献全流程的 Zotero 技能：找文献、追前�
 
 ### 6. 分类整理 `classify`
 
-从题名+摘要识别方法与数据集，生成标签/集合计划，可写入。
+两种模式：打标签（默认），或**按维度在 Zotero 里建文件夹**（`--by`）。两种都要先给用户看计划再写。
+
+**A. 建文件夹（用户说「按论文类型/方法/数据集分类建目录」时用这个）**
+
+```text
+<python> "<skill-dir>/scripts/zotero.py" classify --all --by type,method,dataset
+<python> "<skill-dir>/scripts/zotero.py" classify --tag "project:MI-EEG" --by method --root 我的课题 --apply --yes
+```
+
+- 结构固定为 `根目录 / 维度 / 取值`，默认根目录 `文献分类`，可用 `--root` 改名（可先用 `collect` 或 Zotero 界面建好根目录，再让 `--root` 指向它）。
+- 可用维度：`type`（期刊论文 / 会议论文 / 预印本 / 学位论文 / 综述…）、`method`、`dataset`、`year`、`venue`、`topic`（读 `topic:` 标签）、`project`（读 `project:` 标签）；逗号分开可一次建多层。
+- 一个条目可以同时落在多个文件夹（Zotero 原生支持），不会互相覆盖。
+- 已有同名文件夹会复用，不会重复创建；`--include-unclassified` 把该维度缺失的条目并入 `未标注`。
+- 标题含 review/survey/overview/tutorial/meta-analysis 的会在 `类型` 下额外进 `综述`。
+
+**B. 打标签（默认）**
 
 ```text
 <python> "<skill-dir>/scripts/zotero.py" classify --all

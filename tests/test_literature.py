@@ -219,3 +219,64 @@ class FrontierFileTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CollectionFolderTests(unittest.TestCase):
+    def test_groups_by_dimension_and_path(self):
+        records = [
+            dict(record('K1', 'A study'), methods=['transformer', 'cnn']),
+            dict(record('K2', 'B study'), methods=['cnn']),
+        ]
+        groups = z.collection_plan(records, ['method'], root='文献分类')
+        by_value = {group['value']: group for group in groups}
+        self.assertEqual(sorted(by_value), ['cnn', 'transformer'])
+        self.assertEqual(by_value['cnn']['path'], ['文献分类', '方法', 'cnn'])
+        self.assertEqual(by_value['cnn']['items'], ['K1', 'K2'])
+        self.assertEqual(by_value['transformer']['items'], ['K1'])
+
+    def test_unclassified_bucket_is_opt_in(self):
+        records = [dict(record('K1', 'No terms'))]
+        self.assertEqual(z.collection_plan(records, ['method']), [])
+        groups = z.collection_plan(records, ['method'], include_unclassified=True)
+        self.assertEqual(groups[0]['value'], '未标注')
+
+    def test_type_dimension_marks_reviews(self):
+        self.assertEqual(
+            z.dimension_values(record('K1', 'A survey of EEG'), 'type'),
+            ['期刊论文', '综述'],
+        )
+        self.assertEqual(
+            z.dimension_values(record('K2', 'A new method'), 'type'), ['期刊论文']
+        )
+        odd = dict(record('K3', 'x'), itemType='software')
+        self.assertEqual(z.dimension_values(odd, 'type'), ['其他'])
+
+    def test_topic_dimension_reads_tags(self):
+        rec = dict(
+            record('K1', 'x', tags=['topic:edge-deployment', 'project:MI-EEG'])
+        )
+        self.assertEqual(z.dimension_values(rec, 'topic'), ['edge-deployment'])
+        self.assertEqual(z.dimension_values(rec, 'project'), ['MI-EEG'])
+
+    def test_year_and_venue_dimensions(self):
+        rec = dict(record('K1', 'x', year='2023', venue='Sensors'))
+        self.assertEqual(z.dimension_values(rec, 'year'), ['2023'])
+        self.assertEqual(z.dimension_values(rec, 'venue'), ['Sensors'])
+        bare = dict(record('K2', 'x', year='', venue=''))
+        self.assertEqual(z.dimension_values(bare, 'year'), [])
+        self.assertEqual(z.dimension_values(bare, 'venue'), [])
+
+    def test_parse_dimensions_normalizes_and_rejects(self):
+        self.assertEqual(
+            z.parse_dimensions('Methods;datasets,year'), ['method', 'dataset', 'year']
+        )
+        self.assertEqual(z.parse_dimensions(''), [])
+        with self.assertRaises(SystemExit):
+            z.parse_dimensions('banana')
+
+    def test_markdown_lists_folders_and_counts(self):
+        records = [dict(record('K1', 'A study'), methods=['cnn'])]
+        groups = z.collection_plan(records, ['method'])
+        text = z.collection_plan_markdown(groups, 1, root='文献分类')
+        self.assertIn('文献分类 / 方法 / cnn', text)
+        self.assertIn('1 个文件夹', text)
