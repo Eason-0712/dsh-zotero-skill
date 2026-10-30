@@ -424,6 +424,14 @@ def export_bibtex(item_key: str | None = None, *, include_children: bool = False
     return text + "\n" if text else ""
 
 
+def read_text_file(path: str | Path) -> str:
+    """Read JSON/Markdown that may come from PowerShell (UTF-16) or editors."""
+    data = Path(path).expanduser().read_bytes()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
+
+
 def write_text_output(text: str, out: str | None) -> None:
     if out is None:
         print(text, end="" if text.endswith("\n") else "\n")
@@ -1405,6 +1413,1580 @@ def add_json_flag(parser: argparse.ArgumentParser) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Literature workflow: discovery, frontier tracking, screening, library
+# management, batch reading, classification, landscape, and gap analysis.
+# ---------------------------------------------------------------------------
+
+WRITE_APP_NAME = "DSH Zotero Skill"
+LOCAL_KEY_FILENAME = "local-key.json"
+SERVER_ID_FILENAME = "server-id.json"
+FRONTIER_FILENAME = "frontier.json"
+
+TIER_CORE = 0.60
+TIER_IMPORTANT = 0.42
+
+METHOD_PATTERNS: list[tuple[str, str]] = [
+    ("transformer", r"\btransformers?\b"),
+    ("cnn", r"\b(?:cnns?|convolutional neural networks?|convnets?)\b"),
+    ("gnn", r"\b(?:gnns?|graph neural networks?|graph attention)\b"),
+    ("rnn", r"\b(?:rnn|rnns|recurrent neural networks?|lstms?|gru)\b"),
+    ("gan", r"\b(?:gans?|generative adversarial)\b"),
+    ("diffusion", r"\bdiffusion\b"),
+    ("vae", r"\b(?:vae|variational autoencoders?)\b"),
+    ("reinforcement", r"\breinforcement learning\b"),
+    ("self-supervised", r"\bself[- ]supervised\b"),
+    ("contrastive", r"\bcontrastive\b"),
+    ("distillation", r"\bknowledge distillation\b"),
+    ("federated", r"\bfederated learning\b"),
+    ("transfer", r"\btransfer learning\b"),
+    ("few-shot", r"\b(?:few[- ]shot|zero[- ]shot|one[- ]shot)\b"),
+    ("spiking", r"\bspiking neural networks?\b"),
+    ("mamba", r"\b(?:mamba|state[- ]space model)\b"),
+    ("eegnet", r"\beegnet\b"),
+    ("tcnet", r"\b(?:atcnet|ctnet|tcnet)\b"),
+    ("pose", r"\b(?:6d pose|six[- ]dimensional pose|pose estimation|pose regression)\b"),
+    ("point-cloud", r"\bpoint clouds?\b"),
+    ("grasping", r"\b(?:grasp detection|grasp pose|grasp planning|grasping)\b"),
+    ("detection", r"\bobject detection\b"),
+    ("segmentation", r"\bsemantic segmentation\b"),
+    ("depth", r"\bdepth estimation\b"),
+    ("autoencoder", r"\bautoencoders?\b"),
+    ("svm", r"\b(?:svm|support vector machines?)\b"),
+    ("graph-learning", r"\bgraph learning\b"),
+]
+
+DATASET_PATTERNS: list[tuple[str, str]] = [
+    ("SEED", r"\bseed(?:[- ]?iv|[- ]?v)?\b"),
+    ("DEAP", r"\bdeap\b"),
+    ("DREAMER", r"\bdreamer\b"),
+    ("MPED", r"\bmped\b"),
+    ("PhysioNet", r"\bphysionet\b"),
+    ("CHB-MIT", r"\bchb[- ]?mit\b"),
+    ("TUSZ", r"\btusz\b"),
+    ("TUAB", r"\btuab\b"),
+    ("Bonn", r"\bbonn\b"),
+    ("CHSZ", r"\bchsz\b"),
+    ("BCI-IV-2a", r"\b(?:bci\s*competition\s*iv|iv[- ]?2a)\b"),
+    ("EEGMMIDB", r"\b(?:eegmmidb|physionet\s+motor\s+movement)\b"),
+    ("ImageNet", r"\bimagenet\b"),
+    ("COCO", r"\bcoco\b"),
+    ("YCB", r"\bycb\b"),
+    ("GraspNet", r"\bgraspnet\b"),
+    ("Cornell", r"\bcornell\b"),
+    ("Jacquard", r"\bjacquard\b"),
+    ("LINEMOD", r"\bline[- ]?mod\b"),
+    ("MetaGraspNet", r"\bmetagraspnet\b"),
+    ("KITTI", r"\bkitti\b"),
+    ("nuScenes", r"\bnuscenes\b"),
+    ("ScanNet", r"\bscannet\b"),
+    ("ModelNet", r"\bmodelnet\b"),
+]
+
+TAG_SCOPE_PREFIXES = ("project:", "topic:", "method:", "dataset:", "venue:", "year:", "auto:")
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def load_json_file(path: Path, default: Any) -> Any:
+    if not path.is_file():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def save_json_file(path: Path, payload: Any) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def header_value(headers: dict[str, str], name: str) -> str:
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return str(value)
+    return ""
+
+
+def split_csv(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[,;]", str(raw))
+    return [part.strip() for part in parts if part.strip()]
+
+
+def ensure_yes(args: argparse.Namespace, action: str) -> None:
+    if not getattr(args, "yes", False) and not getattr(args, "dry_run", False):
+        exit_with(f"Refusing to {action} without --yes (use --dry-run to preview)")
+
+
+# --- local API write access -------------------------------------------------
+
+
+def server_id_path() -> Path:
+    return skill_config_dir() / SERVER_ID_FILENAME
+
+
+def local_key_path() -> Path:
+    return skill_config_dir() / LOCAL_KEY_FILENAME
+
+
+def server_id(refresh: bool = False) -> str:
+    if not refresh:
+        cached = load_json_file(server_id_path(), {})
+        if isinstance(cached, dict) and cached.get("serverId"):
+            return str(cached["serverId"])
+    response = request("/api/", timeout=3)
+    if not response.ok:
+        exit_with("Zotero local API is unreachable; start Zotero and enable its local API")
+    value = header_value(response.headers, "Zotero-Server-ID")
+    if value:
+        save_json_file(server_id_path(), {"serverId": value, "savedAt": now_iso()})
+    return value
+
+
+def load_local_key() -> dict[str, Any]:
+    stored = load_json_file(local_key_path(), {})
+    return stored if isinstance(stored, dict) else {}
+
+
+def authorize_zotero(app_name: str = WRITE_APP_NAME) -> dict[str, Any]:
+    sid = server_id()
+    payload = json.dumps({"appName": app_name}).encode("utf-8")
+    headers = {
+        "Zotero-API-Version": "3",
+        "Content-Type": "application/json",
+        "Zotero-Server-ID": sid,
+    }
+    print(
+        "Zotero is asking for permission: choose \"Always Allow\" / 「始终允许」 "
+        f"for {app_name}.",
+        file=sys.stderr,
+    )
+    response = request(
+        "/api/local/authorize",
+        method="POST",
+        data=payload,
+        headers=headers,
+        timeout=300.0,
+    )
+    if not response.ok:
+        detail = response.error or response.text[:TEXT_LIMIT] or "no response body"
+        exit_with(f"Authorization failed: status={response.status} detail={detail}")
+    body = parse_body(response)
+    key = str((body or {}).get("key") or "") if isinstance(body, dict) else ""
+    if not key:
+        exit_with(f"Authorization returned no key: {response.text[:TEXT_LIMIT]}")
+    record = {
+        "key": key,
+        "appName": app_name,
+        "serverId": sid,
+        "remember": bool((body or {}).get("remember")),
+        "authorizedAt": now_iso(),
+    }
+    save_json_file(local_key_path(), record)
+    return record
+
+
+def require_local_key() -> str:
+    key = os.environ.get("ZOTERO_LOCAL_API_KEY") or str(load_local_key().get("key") or "")
+    if not key:
+        exit_with(
+            "Zotero write access is not authorized yet. Run: zotero.py authorize "
+            "(then choose 「始终允许」/Always Allow in Zotero)."
+        )
+    return key
+
+
+def local_write(
+    path: str,
+    payload: Any = None,
+    *,
+    method: str = "PATCH",
+    version: int | str | None = None,
+    timeout: float = 30.0,
+) -> Response:
+    key = require_local_key()
+    headers = {"Zotero-API-Key": key, "Zotero-Server-ID": server_id()}
+    if version is not None:
+        headers["If-Unmodified-Since-Version"] = str(version)
+    response = request(path, method=method, data=payload, headers=headers, timeout=timeout)
+    if response.status == 412:
+        headers["Zotero-Server-ID"] = server_id(refresh=True)
+        response = request(path, method=method, data=payload, headers=headers, timeout=timeout)
+    if response.status == 401:
+        exit_with(
+            "Zotero rejected the stored local API key (401). Run: zotero.py authorize --force"
+        )
+    return response
+
+
+def item_full(item_key: str) -> dict[str, Any]:
+    payload = api_get(f"{LOCAL_USER}/items/{urllib.parse.quote(item_key)}")
+    return payload if isinstance(payload, dict) else {}
+
+
+def patch_item(
+    item_key: str, fields: dict[str, Any], *, dry_run: bool = False
+) -> dict[str, Any]:
+    current = item_full(item_key)
+    version = current.get("version")
+    result = {
+        "key": item_key,
+        "version": version,
+        "fields": sorted(fields),
+        "applied": False,
+    }
+    if dry_run:
+        return result
+    response = local_write(
+        f"{LOCAL_USER}/items/{urllib.parse.quote(item_key)}",
+        fields,
+        method="PATCH",
+        version=version,
+    )
+    require_ok(response, f"PATCH item {item_key}")
+    result["applied"] = True
+    return result
+
+
+def fetch_all(path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    start = 0
+    while True:
+        page_params = dict(params or {})
+        page_params.update({"limit": API_PAGE_LIMIT, "start": start})
+        joiner = "&" if "?" in path else "?"
+        chunk = api_get(f"{path}{joiner}{query(page_params)}")
+        if not isinstance(chunk, list) or not chunk:
+            break
+        rows.extend(chunk)
+        if len(chunk) < API_PAGE_LIMIT:
+            break
+        start += API_PAGE_LIMIT
+    return rows
+
+
+def all_collections() -> list[dict[str, Any]]:
+    payload = api_get(f"{LOCAL_USER}/collections")
+    return payload if isinstance(payload, list) else []
+
+
+def find_collection(name: str) -> dict[str, Any] | None:
+    target = normalize_text(name)
+    for collection in all_collections():
+        data = collection.get("data", collection)
+        key = collection.get("key") or data.get("key")
+        if key == name:
+            return collection
+        if normalize_text(data.get("name")) == target:
+            return collection
+    return None
+
+
+def create_collection(name: str, parent: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"name": name}
+    if parent:
+        parent_record = find_collection(parent)
+        if parent_record is None:
+            exit_with(f"Parent collection not found: {parent}")
+        data = parent_record.get("data", parent_record)
+        payload["parentCollection"] = parent_record.get("key") or data.get("key")
+    response = local_write(f"{LOCAL_USER}/collections", payload, method="POST")
+    require_ok(response, "POST collection")
+    body = parse_body(response)
+    created = (body or {}).get("successful") or {}
+    if isinstance(created, dict) and created:
+        key = next(iter(created))
+        return {"key": key, "data": {"name": name}}
+    return {"key": None, "data": {"name": name}}
+
+
+# --- selection & records ----------------------------------------------------
+
+
+def selected_items(args: argparse.Namespace) -> list[dict[str, Any]]:
+    keys = split_csv(getattr(args, "keys", None))
+    if keys:
+        return [item_full(key) for key in keys]
+
+    limit = clamp_int(getattr(args, "limit", None) or 200, 1, 5000, 200)
+    params: dict[str, Any] = {}
+    if getattr(args, "query", None):
+        params["q"] = args.query
+    if getattr(args, "tag", None):
+        params["tag"] = args.tag
+
+    collection = getattr(args, "collection", None)
+    path = f"{LOCAL_USER}/items/top"
+    if collection:
+        record = find_collection(collection)
+        if record is None:
+            exit_with(f"Collection not found: {collection}")
+        data = record.get("data", record)
+        key = record.get("key") or data.get("key")
+        path = f"{LOCAL_USER}/collections/{urllib.parse.quote(key)}/items/top"
+
+    if not params and not collection and not getattr(args, "all", False):
+        exit_with("Select items with --keys, --query, --tag, --collection, or --all")
+
+    rows: list[dict[str, Any]] = []
+    start = 0
+    while len(rows) < limit:
+        page_params = dict(params)
+        page_params.update({"limit": min(API_PAGE_LIMIT, limit - len(rows)), "start": start})
+        chunk = api_get(f"{path}?{query(page_params)}")
+        if not isinstance(chunk, list) or not chunk:
+            break
+        rows.extend(chunk)
+        if len(chunk) < API_PAGE_LIMIT:
+            break
+        start += API_PAGE_LIMIT
+    return rows
+
+
+def record_from_item(item: dict[str, Any]) -> dict[str, Any]:
+    data = item.get("data", item)
+    venue = (
+        data.get("publicationTitle")
+        or data.get("conferenceName")
+        or data.get("journalAbbreviation")
+        or data.get("proceedingsTitle")
+        or ""
+    )
+    tags = [entry.get("tag") for entry in data.get("tags") or [] if entry.get("tag")]
+    terms = extract_terms(f"{data.get('title') or ''} {data.get('abstractNote') or ''}")
+    return {
+        "key": item.get("key") or data.get("key"),
+        "itemType": data.get("itemType"),
+        "title": data.get("title") or "",
+        "year": year_from_date(data.get("date")),
+        "venue": str(venue).strip(),
+        "doi": normalize_doi(data.get("DOI") or data.get("doi")),
+        "abstract": data.get("abstractNote") or "",
+        "url": data.get("url") or "",
+        "tags": tags,
+        "collections": list(data.get("collections") or []),
+        "methods": terms["methods"],
+        "datasets": terms["datasets"],
+    }
+
+
+def extract_terms(text: str) -> dict[str, list[str]]:
+    lowered = str(text or "").lower()
+    methods = [name for name, pattern in METHOD_PATTERNS if re.search(pattern, lowered)]
+    datasets = [name for name, pattern in DATASET_PATTERNS if re.search(pattern, lowered)]
+    return {"methods": methods, "datasets": datasets}
+
+
+# --- discovery: find / frontier / screen ------------------------------------
+
+
+def venue_stats_for(works: list[dict[str, Any]], mailto: str = "") -> dict[str, dict[str, Any]]:
+    state = load_daily_state()
+    cache = state.get("venues") if isinstance(state.get("venues"), dict) else {}
+    today = date.today()
+    source_ids = [
+        ((work.get("primary_location") or {}).get("source") or {}).get("id", "") for work in works
+    ]
+    stale: list[str] = []
+    for source in sorted({sid for sid in source_ids if sid}):
+        entry = cache.get(source) or {}
+        try:
+            cached_on = date.fromisoformat(str(entry.get("date"))[:10])
+        except ValueError:
+            cached_on = None
+        if cached_on is None or (today - cached_on).days >= 30:
+            stale.append(source)
+    for source, payload in fetch_source_metrics(stale, mailto).items():
+        cache[source] = {
+            "date": today.isoformat(),
+            "display_name": payload.get("display_name"),
+            "summary_stats": payload.get("summary_stats") or {},
+        }
+    if stale and any(cache.get(source) for source in stale):
+        state["venues"] = cache
+        save_daily_state(state)
+    return {
+        source: {
+            "summary_stats": (cache.get(source) or {}).get("summary_stats") or {},
+            "display_name": (cache.get(source) or {}).get("display_name"),
+        }
+        for source in source_ids
+        if source
+    }
+
+
+def gather_candidates(
+    queries: list[str],
+    start_date: str,
+    end_date: str,
+    *,
+    include_preprints: bool = False,
+    mailto: str = "",
+    pages: int = 1,
+) -> list[dict[str, Any]]:
+    works: list[dict[str, Any]] = []
+    for topic in queries:
+        works.extend(
+            fetch_openalex_works(
+                topic,
+                start_date,
+                end_date,
+                include_preprints=include_preprints,
+                mailto=mailto,
+                pages=pages,
+            )
+        )
+    if not works:
+        return []
+
+    venue_stats = venue_stats_for(works, mailto)
+    today = date.today()
+    weights = DEFAULT_DAILY_CONFIG["weights"]
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for work in works:
+        candidate = score_candidate(work, venue_stats, weights, today)
+        key = normalize_doi(work.get("doi")) or str(work.get("id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        if not candidate["title"]:
+            continue
+        access = work.get("open_access") or {}
+        candidate["dedupe_key"] = key
+        candidate["oa"] = bool(access.get("is_oa"))
+        candidate["oa_url"] = str(access.get("oa_url") or "")
+        candidate["type"] = work.get("type")
+        candidates.append(candidate)
+    candidates.sort(key=lambda row: row["score"], reverse=True)
+    return candidates
+
+
+def candidate_rows(candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    return candidates[: max(0, limit)]
+
+
+def print_candidates(rows: list[dict[str, Any]]) -> None:
+    for index, row in enumerate(rows, start=1):
+        authors = row.get("authors") or []
+        first = authors[0] if authors else ""
+        detail = ", ".join(part for part in [row.get("venue") or "", first] if part)
+        flag = "OA " if row.get("oa") else "   "
+        print(
+            f"{index:2}. {row.get('score', 0):.3f} {flag}{row.get('published', '')[:4]} "
+            f"c{row.get('citations', 0):<5} {row.get('title', '')[:110]} | {detail}"
+        )
+
+
+def import_candidates(
+    candidates: list[dict[str, Any]], *, session: str | None = None
+) -> dict[str, Any]:
+    if not candidates:
+        return {"imported": 0, "session": None}
+    text = "\n\n".join(
+        build_bibtex_entry(candidate, index) for index, candidate in enumerate(candidates)
+    )
+    session = session or f"dsh-{uuid.uuid4().hex}"
+    path = f"/connector/import?{query({'session': session})}"
+    response = require_ok(connector_post(path, text, content_type="text/plain"), f"POST {path}")
+    return {"imported": len(candidates), "session": session, "response": parse_body(response)}
+
+
+def default_window(args: argparse.Namespace) -> tuple[str, str]:
+    today = date.today()
+    end = args.date_to or today.isoformat()
+    if args.days:
+        start = today - timedelta(days=clamp_int(args.days, 1, 3650, 30))
+        return start.isoformat(), end
+    if args.date_from:
+        return args.date_from, end
+    return (today - timedelta(days=730)).isoformat(), end
+
+
+def cmd_find(args: argparse.Namespace) -> None:
+    start, end = default_window(args)
+    queries = [part.strip() for part in args.query if part and part.strip()]
+    if not queries:
+        exit_with("Provide at least one query")
+
+    candidates = gather_candidates(
+        queries,
+        start,
+        end,
+        include_preprints=args.include_preprints or args.work_type == "preprint",
+        mailto=args.mailto,
+    )
+    api_up = request("/api/", timeout=2).ok
+    kept: list[dict[str, Any]] = []
+    skipped = {"in_library": 0, "low_score": 0, "not_open_access": 0, "wrong_type": 0}
+    for candidate in candidates:
+        if args.oa and not candidate.get("oa"):
+            skipped["not_open_access"] += 1
+            continue
+        if args.work_type and candidate.get("type") != args.work_type:
+            skipped["wrong_type"] += 1
+            continue
+        if candidate["score"] < args.min_score:
+            skipped["low_score"] += 1
+            continue
+        if api_up and not args.include_library and library_has_item(
+            candidate["title"], candidate["doi"]
+        ):
+            skipped["in_library"] += 1
+            continue
+        kept.append(candidate)
+
+    limit = clamp_int(args.limit, 1, 100, 20)
+    rows = candidate_rows(kept, limit)
+
+    if args.bib:
+        text = "\n\n".join(build_bibtex_entry(row, i) for i, row in enumerate(rows))
+        path = Path(args.bib).expanduser().resolve()
+        write_text_output(text + ("\n" if text else ""), str(path))
+    if args.out:
+        save_json_file(Path(args.out).expanduser().resolve(), rows)
+    if args.do_import:
+        ensure_yes(args, "import search results into Zotero")
+        result = import_candidates(rows)
+        print(json.dumps(result, ensure_ascii=False))
+
+    payload = {
+        "window": {"from": start, "to": end},
+        "queries": queries,
+        "candidates": len(candidates),
+        "kept": len(rows),
+        "skipped": skipped,
+        "results": rows,
+    }
+    if args.json:
+        dump_json(payload["results"] if args.out or args.bib else payload)
+        return
+    print(
+        f"{len(candidates)} candidates from OpenAlex, kept {len(rows)} "
+        f"({skipped['in_library']} already in library, {skipped['low_score']} below score)"
+    )
+    print_candidates(rows)
+
+
+def frontier_path() -> Path:
+    return skill_config_dir() / FRONTIER_FILENAME
+
+
+def load_frontier() -> dict[str, Any]:
+    stored = load_json_file(frontier_path(), {})
+    watches = stored.get("watches") if isinstance(stored, dict) else {}
+    return {"watches": watches if isinstance(watches, dict) else {}}
+
+
+def save_frontier(payload: dict[str, Any]) -> Path:
+    return save_json_file(frontier_path(), payload)
+
+
+def cmd_frontier(args: argparse.Namespace) -> None:
+    store = load_frontier()
+    watches = store["watches"]
+
+    if args.action == "list":
+        if not watches:
+            print("No watches yet. Add one: zotero.py frontier add eeg --query \"motor imagery\"")
+            return
+        dump_json(watches)
+        return
+
+    if args.action == "add":
+        if not args.name:
+            exit_with("Provide a watch name")
+        queries = args.query or []
+        if not queries:
+            exit_with("Provide at least one --query")
+        watches[args.name] = {
+            "queries": queries,
+            "days": clamp_int(args.days, 1, 3650, 30),
+            "max": clamp_int(args.max, 1, 100, 10),
+            "include_preprints": bool(args.include_preprints),
+            "last_run": None,
+            "createdAt": now_iso(),
+        }
+        path = save_frontier(store)
+        dump_json({"saved": str(path), "watch": watches[args.name]})
+        return
+
+    if args.action == "remove":
+        if not args.name or args.name not in watches:
+            exit_with(f"Unknown watch: {args.name}")
+        removed = watches.pop(args.name)
+        save_frontier(store)
+        dump_json({"removed": args.name, "queries": removed.get("queries")})
+        return
+
+    names = [args.name] if args.name else sorted(watches)
+    if not names:
+        exit_with("No watches configured; run: zotero.py frontier add <name> --query <text>")
+
+    today = date.today()
+    report: dict[str, Any] = {}
+    imported_total = 0
+    for name in names:
+        watch = watches.get(name)
+        if not isinstance(watch, dict):
+            report[name] = {"error": "unknown watch"}
+            continue
+        since = None
+        if args.since_last and watch.get("last_run"):
+            since = str(watch["last_run"])[:10]
+        start = since or (today - timedelta(days=int(watch.get("days") or 30))).isoformat()
+        candidates = gather_candidates(
+            [str(q) for q in watch.get("queries") or []],
+            start,
+            today.isoformat(),
+            include_preprints=bool(watch.get("include_preprints")),
+            mailto=args.mailto,
+        )
+        state = load_daily_state()
+        seen = state.get("seen", {}) if isinstance(state.get("seen"), dict) else {}
+        api_up = request("/api/", timeout=2).ok
+        fresh: list[dict[str, Any]] = []
+        for candidate in candidates:
+            key = candidate.get("dedupe_key") or ""
+            if key and key in seen:
+                continue
+            if api_up and library_has_item(candidate["title"], candidate["doi"]):
+                continue
+            fresh.append(candidate)
+        fresh = candidate_rows(fresh, int(watch.get("max") or 10))
+
+        if args.do_import and fresh:
+            ensure_yes(args, "import frontier results into Zotero")
+            import_candidates(fresh)
+            imported_total += len(fresh)
+
+        for candidate in fresh:
+            key = candidate.get("dedupe_key") or ""
+            if key:
+                seen[key] = today.isoformat()
+        state["seen"] = seen
+        save_daily_state(state)
+
+        watch["last_run"] = now_iso()
+        report[name] = {
+            "window": {"from": start, "to": today.isoformat()},
+            "found": len(fresh),
+            "results": fresh,
+        }
+
+    save_frontier(store)
+    if args.out:
+        save_json_file(Path(args.out).expanduser().resolve(), report)
+    if args.json:
+        dump_json(report)
+        return
+    for name, entry in report.items():
+        if "error" in entry:
+            print(f"[{name}] error: {entry['error']}")
+            continue
+        window = entry.get("window") or {}
+        print(f"[{name}] {entry.get('found', 0)} new ({window.get('from')} → {window.get('to')})")
+        print_candidates(entry.get("results") or [])
+    if imported_total:
+        print(f"imported {imported_total} records")
+
+
+def tier_for(score: float) -> str:
+    if score >= TIER_CORE:
+        return "核心"
+    if score >= TIER_IMPORTANT:
+        return "重要"
+    return "参考"
+
+
+def library_score(record: dict[str, Any], newest_year: int | None) -> float:
+    score = 0.0
+    if record.get("doi"):
+        score += 0.2
+    if record.get("abstract"):
+        score += 0.25
+    if record.get("venue"):
+        score += 0.2
+    year = record.get("year")
+    if year and newest_year and str(year).isdigit():
+        gap = newest_year - int(year)
+        score += max(0.0, 0.3 - 0.02 * max(0, gap))
+    return round(min(1.0, score), 3)
+
+
+def screen_markdown(rows: list[dict[str, Any]], title: str, note: str = "") -> str:
+    lines = [f"# {title}", ""]
+    lines.append("| # | 档位 | 分数 | 年份 | 期刊/会议 | 被引 | OA | 标题 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    for index, row in enumerate(rows, start=1):
+        tier = row.get("tier") or tier_for(float(row.get("score") or 0))
+        score = float(row.get("score") or 0)
+        oa = "是" if row.get("oa") else ""
+        lines.append(
+            "| {index} | {tier} | {score:.3f} | {year} | {venue} | {cites} | {oa} | {title} |".format(
+                index=index,
+                tier=tier,
+                score=score,
+                year=row.get("published", "")[:4] or row.get("year") or "",
+                venue=md_cell(row.get("venue") or ""),
+                cites=row.get("citations", ""),
+                oa=oa,
+                title=md_cell(row.get("title") or ""),
+            )
+        )
+    lines.append("")
+    core = [
+        row
+        for row in rows
+        if (row.get("tier") or tier_for(float(row.get("score") or 0))) == "核心"
+    ]
+    lines.append(f"共 {len(rows)} 篇，其中核心 {len(core)} 篇。")
+    if note:
+        lines.append(note)
+    return "\n".join(lines) + "\n"
+
+
+def cmd_screen(args: argparse.Namespace) -> None:
+    candidates: list[dict[str, Any]] = []
+    if args.input:
+        raw = sys.stdin.read() if args.input == "-" else read_text_file(args.input)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            exit_with(f"Cannot parse --input JSON: {exc}")
+        if isinstance(payload, dict):
+            payload = payload.get("results") or payload.get("candidates") or []
+        if not isinstance(payload, list):
+            exit_with("--input must contain a JSON list of candidates")
+        candidates = [row for row in payload if isinstance(row, dict)]
+        for row in candidates:
+            row["score"] = float(row.get("score") or 0)
+    elif args.query:
+        start = (date.today() - timedelta(days=730)).isoformat()
+        candidates = gather_candidates(
+            args.query, start, date.today().isoformat(), include_preprints=False
+        )
+    elif args.library:
+        if not (args.keys or args.tag or args.collection or args.all):
+            args.all = True
+        records = [record_from_item(item) for item in selected_items(args)]
+        years = [int(row["year"]) for row in records if row.get("year") and str(row["year"]).isdigit()]
+        newest = max(years) if years else None
+        for record in records:
+            record["score"] = library_score(record, newest)
+            record["published"] = record.get("year") or ""
+        candidates = records
+    else:
+        exit_with("Provide --input, --query, or --library")
+
+    kept = [row for row in candidates if float(row.get("score") or 0) >= args.min_score]
+    kept.sort(key=lambda row: float(row.get("score") or 0), reverse=True)
+    rows = kept[: clamp_int(args.top, 1, 200, 15)]
+    if args.library:
+        # Local items carry no citation counts, so tiers are relative ranks
+        # inside the screened set rather than absolute impact scores.
+        total = len(rows)
+        core_cut = max(1, int(round(total * 0.2)))
+        important_cut = max(core_cut, int(round(total * 0.5)))
+        for index, row in enumerate(rows):
+            if index < core_cut:
+                row["tier"] = "核心"
+            elif index < important_cut:
+                row["tier"] = "重要"
+            else:
+                row["tier"] = "参考"
+    else:
+        for row in rows:
+            row["tier"] = tier_for(float(row.get("score") or 0))
+
+    note = "本地条目没有引用数据，档位按分数相对排名。" if args.library else ""
+    text = screen_markdown(rows, "核心论文筛选", note)
+    if args.out:
+        path = Path(args.out).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    if args.json:
+        dump_json(rows)
+        return
+    print(text, end="")
+
+
+# --- library management: tag / collect / classify / dupes -------------------
+
+
+def cmd_authorize(args: argparse.Namespace) -> None:
+    if load_local_key().get("key") and not args.force:
+        current = load_local_key()
+        if args.json:
+            dump_json({"status": "already-authorized", **{k: current.get(k) for k in ("appName", "remember", "authorizedAt")}})
+            return
+        print(
+            "A local API key is already stored "
+            f"({current.get('authorizedAt')}). Use --force to request a new one."
+        )
+        return
+    record = authorize_zotero(args.app_name)
+    if args.json:
+        dump_json({"status": "authorized", **{k: record.get(k) for k in ("appName", "remember", "authorizedAt")}})
+        return
+    remember = record.get("remember")
+    print(f"Authorized {record.get('appName')} (persistent={remember}).")
+    if not remember:
+        print(
+            "The key is single-use because \"Always Allow\" was not chosen; "
+            "re-run authorize when a write returns 401.",
+            file=sys.stderr,
+        )
+
+
+def cmd_tag(args: argparse.Namespace) -> None:
+    items = selected_items(args)
+    if not items:
+        exit_with("No items matched the selection")
+    add = split_csv(args.add)
+    remove = split_csv(args.remove)
+    replace = split_csv(args.replace)
+    if not add and not remove and not replace:
+        exit_with("Provide --add, --remove, or --replace")
+    ensure_yes(args, "modify Zotero tags")
+
+    results: list[dict[str, Any]] = []
+    for item in items:
+        data = item.get("data", item)
+        key = item.get("key") or data.get("key")
+        current = [entry.get("tag") for entry in data.get("tags") or [] if entry.get("tag")]
+        if replace:
+            updated = list(dict.fromkeys(replace))
+        else:
+            updated = [tag for tag in current if tag not in remove]
+            for tag in add:
+                if tag not in updated:
+                    updated.append(tag)
+        if sorted(updated) == sorted(current):
+            results.append({"key": key, "tags": updated, "changed": False})
+            continue
+        outcome = patch_item(key, {"tags": [{"tag": tag} for tag in updated]}, dry_run=args.dry_run)
+        outcome.update({"tags": updated, "changed": True})
+        results.append(outcome)
+
+    changed = sum(1 for row in results if row.get("changed"))
+    dump_json({"items": len(results), "changed": changed, "results": results})
+
+
+def cmd_collect(args: argparse.Namespace) -> None:
+    items = selected_items(args)
+    if not items:
+        exit_with("No items matched the selection")
+    ensure_yes(args, "add items to a Zotero collection")
+
+    record = find_collection(args.name)
+    created = False
+    if record is None:
+        if args.dry_run:
+            record = {"key": None, "data": {"name": args.name}}
+            created = True
+        else:
+            record = create_collection(args.name, args.parent)
+            created = True
+    data = record.get("data", record)
+    collection_key = record.get("key") or data.get("key")
+
+    results: list[dict[str, Any]] = []
+    for item in items:
+        payload = item.get("data", item)
+        key = item.get("key") or payload.get("key")
+        current = list(payload.get("collections") or [])
+        if collection_key and collection_key in current:
+            results.append({"key": key, "added": False})
+            continue
+        updated = current + ([collection_key] if collection_key else [])
+        outcome = patch_item(key, {"collections": updated}, dry_run=args.dry_run)
+        outcome["added"] = True
+        results.append(outcome)
+
+    dump_json(
+        {
+            "collection": {"name": args.name, "key": collection_key, "created": created},
+            "items": len(results),
+            "added": sum(1 for row in results if row.get("added")),
+            "dryRun": bool(args.dry_run),
+            "results": results,
+        }
+    )
+
+
+def classify_plan(
+    records: list[dict[str, Any]],
+    *,
+    by_method: bool = True,
+    by_dataset: bool = True,
+    by_year: bool = False,
+    by_venue: bool = False,
+    tag_prefix: str = "auto:",
+) -> list[dict[str, Any]]:
+    plan: list[dict[str, Any]] = []
+    for record in records:
+        tags: list[str] = []
+        collection = None
+        if by_method:
+            tags.extend(f"{tag_prefix}method:{name}" for name in record.get("methods") or [])
+        if by_dataset:
+            tags.extend(f"{tag_prefix}dataset:{name}" for name in record.get("datasets") or [])
+        if by_year and record.get("year"):
+            tags.append(f"{tag_prefix}year:{record['year']}")
+        if by_venue and record.get("venue"):
+            collection = str(record["venue"])[:120]
+        existing = set(record.get("tags") or [])
+        missing = [tag for tag in dict.fromkeys(tags) if tag not in existing]
+        plan.append(
+            {
+                "key": record.get("key"),
+                "title": record.get("title"),
+                "addTags": missing,
+                "collection": collection,
+            }
+        )
+    return plan
+
+
+def cmd_classify(args: argparse.Namespace) -> None:
+    records = [record_from_item(item) for item in selected_items(args)]
+    if not records:
+        exit_with("No items matched the selection")
+    plan = classify_plan(
+        records,
+        by_method=not args.no_method,
+        by_dataset=not args.no_dataset,
+        by_year=args.by_year,
+        by_venue=args.by_venue,
+        tag_prefix=args.tag_prefix,
+    )
+    changed = [row for row in plan if row["addTags"] or row["collection"]]
+
+    if not args.apply:
+        if args.json:
+            dump_json({"items": len(plan), "toChange": len(changed), "plan": plan})
+            return
+        lines = [
+            f"# 分类整理计划（{len(plan)} 篇，需改动 {len(changed)} 篇）",
+            "",
+            "只列出将要新增的标签；加 --apply --yes 才会写入 Zotero。",
+            "",
+            "| 条目 | 新增标签 | 集合 | 标题 |",
+            "| --- | --- | --- | --- |",
+        ]
+        for row in changed:
+            lines.append(
+                "| `{key}` | {tags} | {collection} | {title} |".format(
+                    key=row["key"],
+                    tags=", ".join(f"`{tag}`" for tag in row["addTags"]) or "",
+                    collection=md_cell(row.get("collection") or ""),
+                    title=md_cell(row.get("title") or ""),
+                )
+            )
+        print("\n".join(lines))
+        return
+    ensure_yes(args, "apply a classification plan")
+
+    collection_keys: dict[str, str] = {}
+    results: list[dict[str, Any]] = []
+    for row in changed:
+        item = item_full(str(row["key"]))
+        data = item.get("data", item)
+        current_tags = [entry.get("tag") for entry in data.get("tags") or [] if entry.get("tag")]
+        merged_tags = current_tags + [tag for tag in row["addTags"] if tag not in current_tags]
+        collections = list(data.get("collections") or [])
+        name = row.get("collection")
+        if name:
+            if name not in collection_keys:
+                found = find_collection(name)
+                if found is None:
+                    created = create_collection(name)
+                    collection_keys[name] = str(created.get("key") or "")
+                else:
+                    found_data = found.get("data", found)
+                    collection_keys[name] = str(found.get("key") or found_data.get("key") or "")
+            key = collection_keys[name]
+            if key and key not in collections:
+                collections.append(key)
+        fields: dict[str, Any] = {}
+        if merged_tags != current_tags:
+            fields["tags"] = [{"tag": tag} for tag in merged_tags]
+        if collections != list(data.get("collections") or []):
+            fields["collections"] = collections
+        if not fields:
+            results.append({"key": row["key"], "changed": False})
+            continue
+        outcome = patch_item(str(row["key"]), fields, dry_run=args.dry_run)
+        outcome["changed"] = True
+        results.append(outcome)
+
+    dump_json(
+        {
+            "items": len(plan),
+            "changed": sum(1 for row in results if row.get("changed")),
+            "collections": collection_keys,
+            "results": results,
+        }
+    )
+
+
+def duplicate_groups(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group items that share a DOI (case-insensitive) or a normalized title."""
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    def union(left: str, right: str) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    by_key = {str(record.get("key")): record for record in records}
+    buckets: dict[str, str] = {}
+    for record in records:
+        key = str(record.get("key"))
+        find(key)
+        doi = normalize_doi(record.get("doi"))
+        title = normalize_text(record.get("title"))
+        for bucket in (f"doi:{doi}" if doi else "", f"title:{title}" if title else ""):
+            if not bucket:
+                continue
+            if bucket in buckets:
+                union(buckets[bucket], key)
+            else:
+                buckets[bucket] = key
+
+    clusters: dict[str, list[dict[str, Any]]] = {}
+    for key in by_key:
+        clusters.setdefault(find(key), []).append(by_key[key])
+
+    result: list[dict[str, Any]] = []
+    for rows in clusters.values():
+        if len(rows) < 2:
+            continue
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                -len(row.get("tags") or []),
+                -len(row.get("abstract") or ""),
+                str(row.get("key")),
+            ),
+        )
+        result.append(
+            {
+                "doi": ordered[0].get("doi"),
+                "title": ordered[0].get("title"),
+                "keep": ordered[0].get("key"),
+                "duplicates": [row.get("key") for row in ordered[1:]],
+                "keys": [row.get("key") for row in ordered],
+            }
+        )
+    return result
+
+
+def cmd_dupes(args: argparse.Namespace) -> None:
+    records = [record_from_item(item) for item in selected_items(args)]
+    groups = duplicate_groups(records)
+    if args.trash:
+        ensure_yes(args, "move duplicate items to the Zotero trash")
+        for group in groups:
+            for key in group["duplicates"]:
+                patch_item(str(key), {"deleted": 1}, dry_run=args.dry_run)
+    payload = {"items": len(records), "groups": len(groups), "duplicates": groups}
+    if args.json:
+        dump_json(payload)
+        return
+    if not groups:
+        print("No duplicates found.")
+        return
+    for group in groups:
+        print(f"keep {group['keep']}  dup {', '.join(str(k) for k in group['duplicates'])}")
+        print(f"  {group.get('title')}")
+        if group.get("doi"):
+            print(f"  doi {group['doi']}")
+
+
+# --- batch reading: digest --------------------------------------------------
+
+
+def item_attachments(item_key: str) -> list[dict[str, Any]]:
+    payload = api_get(f"{LOCAL_USER}/items/{urllib.parse.quote(item_key)}/children")
+    return payload if isinstance(payload, list) else []
+
+
+def attachment_fulltext(attachment_key: str) -> str:
+    response = request(
+        f"{LOCAL_USER}/items/{urllib.parse.quote(attachment_key)}/fulltext", timeout=20
+    )
+    if not response.ok:
+        return ""
+    body = parse_body(response)
+    if isinstance(body, dict):
+        return str(body.get("content") or "")
+    return response.text
+
+
+DIGEST_HEADING_RE = re.compile(
+    r"^(?:(?:[IVXLC]+|\d+(?:\.\d+)*)\.?\s+)?"
+    r"(abstract|index terms|introduction|related work[s]?|background|"
+    r"proposed (?:method|approach|framework|model|system)|method[s]?|methodology|"
+    r"materials and methods|system model|problem formulation|"
+    r"experiment[s]?(?: and results)?|experimental (?:setup|results)|results|"
+    r"results and discussion|evaluation|discussion|conclusions?|"
+    r"conclusions? and future work|future work|limitations|acknowledg(?:e?ments?)?)"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+
+def text_outline(text: str, limit: int = 14) -> list[tuple[str, int]]:
+    outline: list[tuple[str, int]] = []
+    for raw_line in str(text or "").splitlines():
+        line = " ".join(raw_line.split())
+        if not line or len(line) > 80:
+            continue
+        if DIGEST_HEADING_RE.match(line):
+            if outline and outline[-1][0].lower() == line.lower():
+                continue
+            outline.append((line, len(outline) + 1))
+            if len(outline) >= limit:
+                break
+    return outline
+
+
+def slugify(text: str, limit: int = 60) -> str:
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", str(text or "").strip().lower())
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+    return cleaned[:limit] or "paper"
+
+
+def md_cell(value: Any) -> str:
+    return str(value or "").replace("|", "\\|").replace("\n", " ")
+
+
+def wrap_paragraphs(text: str, width: int = 100) -> str:
+    paragraphs = [block.strip() for block in str(text or "").split("\n") if block.strip()]
+    return "\n\n".join(paragraphs) if paragraphs else ""
+
+
+def cmd_digest(args: argparse.Namespace) -> None:
+    records = [record_from_item(item) for item in selected_items(args)]
+    if not records:
+        exit_with("No items matched the selection")
+    out_dir = Path(args.out).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    limit = clamp_int(args.limit, 1, 500, 50)
+    records = records[:limit]
+    index_rows: list[tuple[str, str, str, str]] = []
+    written: list[dict[str, Any]] = []
+
+    for record in records:
+        key = str(record.get("key") or "")
+        filename = f"{key}-{slugify(record.get('title') or '')}.md"
+        path = out_dir / filename
+        abstract = wrap_paragraphs(record.get("abstract") or "")
+        sections: list[str] = []
+        fulltext_chars = 0
+        if args.fulltext:
+            for attachment in item_attachments(key):
+                data = attachment.get("data", attachment)
+                if data.get("itemType") != "attachment":
+                    continue
+                body = attachment_fulltext(str(attachment.get("key")))
+                if not body:
+                    continue
+                fulltext_chars = max(fulltext_chars, len(body))
+                outline = text_outline(body)
+                if outline:
+                    sections.extend(f"- {title}" for title, _ in outline)
+                break
+
+        lines = [
+            f"# {record.get('title')}",
+            "",
+            f"- 条目: `{key}`",
+            f"- 年份: {record.get('year') or '未知'}",
+            f"- 期刊/会议: {record.get('venue') or '未知'}",
+            f"- DOI: {record.get('doi') or '无'}",
+            f"- 标签: {', '.join(record.get('tags') or []) or '无'}",
+            f"- 方法线索: {', '.join(record.get('methods') or []) or '未识别'}",
+            f"- 数据集线索: {', '.join(record.get('datasets') or []) or '未识别'}",
+        ]
+        if record.get("url"):
+            lines.append(f"- 链接: {record['url']}")
+        if args.fulltext:
+            lines.append(f"- 全文缓存: {fulltext_chars} 字符")
+        lines.extend(["", "## 摘要", "", abstract or "_无摘要_", "", "## 阅读提示", ""])
+        if sections:
+            lines.extend(["从全文缓存识别到的章节：", ""])
+            lines.extend(sections)
+        else:
+            lines.append("未找到全文缓存；先在 Zotero 中为条目建立 PDF 索引，或阅读原文。")
+        lines.extend(["", "## 笔记", "", "- 结论：", "- 方法：", "- 数据：", "- 可复用点：", ""])
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        index_rows.append(
+            (
+                key,
+                str(record.get("year") or ""),
+                md_cell(record.get("venue") or ""),
+                f"[{md_cell(record.get('title') or key)}]({filename})",
+            )
+        )
+        written.append({"key": key, "path": str(path), "fulltextChars": fulltext_chars})
+
+    index = ["# 批量阅读包", "", f"共 {len(written)} 篇，生成于 {now_iso()}。", ""]
+    index.append("| 条目 | 年份 | 期刊/会议 | 标题 |")
+    index.append("| --- | --- | --- | --- |")
+    for row in index_rows:
+        index.append("| {0} | {1} | {2} | {3} |".format(*row))
+    index.append("")
+    (out_dir / "index.md").write_text("\n".join(index) + "\n", encoding="utf-8")
+    save_json_file(out_dir / "digest.json", {"generatedAt": now_iso(), "items": written})
+
+    payload = {"out": str(out_dir), "items": len(written), "index": str(out_dir / "index.md")}
+    dump_json(payload) if args.json else print(f"wrote {len(written)} notes to {out_dir}")
+
+
+# --- landscape & gaps -------------------------------------------------------
+
+
+def tag_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        for tag in record.get("tags") or []:
+            counts[tag] = counts.get(tag, 0) + 1
+    return dict(sorted(counts.items(), key=lambda row: row[1], reverse=True))
+
+
+def year_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        year = str(record.get("year") or "")
+        if year.isdigit():
+            counts[year] = counts.get(year, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def term_counts(records: list[dict[str, Any]], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        for term in record.get(field) or []:
+            counts[term] = counts.get(term, 0) + 1
+    return dict(sorted(counts.items(), key=lambda row: row[1], reverse=True))
+
+
+def cooccurrence(
+    records: list[dict[str, Any]], left_field: str, right_field: str
+) -> dict[tuple[str, str], int]:
+    matrix: dict[tuple[str, str], int] = {}
+    for record in records:
+        for left in record.get(left_field) or []:
+            for right in record.get(right_field) or []:
+                matrix[(left, right)] = matrix.get((left, right), 0) + 1
+    return matrix
+
+
+def landscape_payload(records: list[dict[str, Any]]) -> dict[str, Any]:
+    years = year_counts(records)
+    recent_years = sorted(years)[-3:]
+    earlier_years = sorted(years)[:-3]
+    recent = sum(years[year] for year in recent_years)
+    earlier = sum(years[year] for year in earlier_years)
+    venues = term_counts(
+        [dict(record, venue_list=[record["venue"]] if record.get("venue") else []) for record in records],
+        "venue_list",
+    )
+    matrix = cooccurrence(records, "methods", "datasets")
+    top_methods = list(term_counts(records, "methods"))[:10]
+    top_datasets = list(term_counts(records, "datasets"))[:10]
+    grid = [
+        {method: matrix.get((method, dataset), 0) for method in top_methods}
+        for dataset in top_datasets
+    ]
+    return {
+        "items": len(records),
+        "years": years,
+        "venues": dict(list(venues.items())[:15]),
+        "tags": dict(list(tag_counts(records).items())[:25]),
+        "methods": term_counts(records, "methods"),
+        "datasets": term_counts(records, "datasets"),
+        "matrix": {
+            "methods": top_methods,
+            "datasets": top_datasets,
+            "counts": grid,
+        },
+        "growth": {
+            "recentYears": recent_years,
+            "recentCount": recent,
+            "earlierYears": earlier_years,
+            "earlierCount": earlier,
+        },
+    }
+
+
+def landscape_markdown(payload: dict[str, Any]) -> str:
+    lines = ["# 研究脉络", "", f"样本 {payload['items']} 篇。", ""]
+    lines.append("## 年度分布")
+    lines.append("")
+    lines.append("| 年份 | 篇数 |")
+    lines.append("| --- | --- |")
+    for year, count in payload["years"].items():
+        lines.append(f"| {year} | {count} |")
+    growth = payload["growth"]
+    if growth.get("earlierCount") or growth.get("recentCount"):
+        lines.append("")
+        lines.append(
+            "近三年 {recent} 篇，此前 {earlier} 篇（{years}）。".format(
+                recent=growth["recentCount"],
+                earlier=growth["earlierCount"],
+                years=", ".join(growth.get("recentYears") or []) or "无",
+            )
+        )
+
+    lines.extend(["", "## 主要期刊/会议", ""])
+    if payload["venues"]:
+        lines.append("| 期刊/会议 | 篇数 |")
+        lines.append("| --- | --- |")
+        for venue, count in payload["venues"].items():
+            lines.append(f"| {md_cell(venue)} | {count} |")
+    else:
+        lines.append("样本中没有期刊/会议字段。")
+
+    lines.extend(["", "## 方法分布", ""])
+    if payload["methods"]:
+        lines.append("| 方法 | 篇数 |")
+        lines.append("| --- | --- |")
+        for method, count in payload["methods"].items():
+            lines.append(f"| {method} | {count} |")
+    else:
+        lines.append("未识别到方法线索（标题与摘要中没有命中术语表）。")
+
+    lines.extend(["", "## 数据集分布", ""])
+    if payload["datasets"]:
+        lines.append("| 数据集 | 篇数 |")
+        lines.append("| --- | --- |")
+        for dataset, count in payload["datasets"].items():
+            lines.append(f"| {dataset} | {count} |")
+    else:
+        lines.append("未识别到数据集线索。")
+
+    matrix = payload["matrix"]
+    if matrix["methods"] and matrix["datasets"]:
+        lines.extend(["", "## 方法 × 数据集", ""])
+        header = "| 数据集 \\ 方法 | " + " | ".join(matrix["methods"]) + " |"
+        lines.append(header)
+        lines.append("| --- " * (len(matrix["methods"]) + 1) + "|")
+        for index, dataset in enumerate(matrix["datasets"]):
+            row = matrix["counts"][index]
+            cells = " | ".join(str(row.get(method, 0)) for method in matrix["methods"])
+            lines.append(f"| {dataset} | {cells} |")
+
+    lines.extend(["", "## 标签分布", ""])
+    if payload["tags"]:
+        lines.append("| 标签 | 篇数 |")
+        lines.append("| --- | --- |")
+        for tag, count in payload["tags"].items():
+            lines.append(f"| {md_cell(tag)} | {count} |")
+    else:
+        lines.append("样本没有标签。")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_landscape(args: argparse.Namespace) -> None:
+    records = [record_from_item(item) for item in selected_items(args)]
+    if not records:
+        exit_with("No items matched the selection")
+    payload = landscape_payload(records)
+    text = landscape_markdown(payload)
+    if args.out:
+        path = Path(args.out).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    if args.json:
+        dump_json(payload)
+        return
+    print(text, end="")
+
+
+def grouping_prefix(records: list[dict[str, Any]]) -> str:
+    for prefix in ("project:", "topic:"):
+        for record in records:
+            for tag in record.get("tags") or []:
+                if str(tag).startswith(prefix):
+                    return prefix
+    return ""
+
+
+def group_records(
+    records: list[dict[str, Any]], prefix: str
+) -> dict[str, list[dict[str, Any]]]:
+    if not prefix:
+        return {"全部文献": records}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        names = [
+            str(tag)[len(prefix) :]
+            for tag in record.get("tags") or []
+            if str(tag).startswith(prefix)
+        ]
+        if not names:
+            groups.setdefault("未分组", []).append(record)
+            continue
+        for name in names:
+            groups.setdefault(name, []).append(record)
+    return dict(sorted(groups.items(), key=lambda row: len(row[1]), reverse=True))
+
+
+def group_gap_block(rows: list[dict[str, Any]], min_freq: int) -> dict[str, Any]:
+    method_counts = term_counts(rows, "methods")
+    dataset_counts = term_counts(rows, "datasets")
+    matrix = cooccurrence(rows, "methods", "datasets")
+    frequent_methods = [name for name, count in method_counts.items() if count >= min_freq]
+    frequent_datasets = [name for name, count in dataset_counts.items() if count >= min_freq]
+    empty_cells = [
+        {
+            "method": method,
+            "dataset": dataset,
+            "methodCount": method_counts[method],
+            "datasetCount": dataset_counts[dataset],
+        }
+        for method in frequent_methods
+        for dataset in frequent_datasets
+        if matrix.get((method, dataset), 0) == 0
+    ]
+    empty_cells.sort(key=lambda row: row["methodCount"] * row["datasetCount"], reverse=True)
+
+    tag_years: dict[str, list[int]] = {}
+    for record in rows:
+        year = str(record.get("year") or "")
+        if not year.isdigit():
+            continue
+        for tag in record.get("tags") or []:
+            tag_years.setdefault(str(tag), []).append(int(year))
+    cooled = [
+        {"tag": tag, "lastYear": max(years), "count": len(years)}
+        for tag, years in tag_years.items()
+        if len(years) >= min_freq and max(years) <= date.today().year - 2
+    ]
+    cooled.sort(key=lambda row: (row["lastYear"], -row["count"]))
+    unlabeled = [
+        {"key": record.get("key"), "title": record.get("title")}
+        for record in rows
+        if not record.get("methods") or not record.get("datasets")
+    ]
+    return {
+        "items": len(rows),
+        "emptyCells": empty_cells[:12],
+        "cooledTags": cooled[:10],
+        "unlabeled": unlabeled[:20],
+        "counts": {"methods": method_counts, "datasets": dataset_counts},
+    }
+
+
+def gap_payload(
+    records: list[dict[str, Any]], min_freq: int = 2, prefix: str = ""
+) -> dict[str, Any]:
+    groups = group_records(records, prefix)
+    payload: dict[str, Any] = {
+        "items": len(records),
+        "groupKey": prefix or None,
+        "groups": [],
+    }
+    for name, rows in groups.items():
+        block = group_gap_block(rows, min_freq)
+        block["name"] = name
+        payload["groups"].append(block)
+    return payload
+
+
+def gap_markdown(payload: dict[str, Any]) -> str:
+    lines = ["# 研究空白候选", ""]
+    lines.append(
+        f"样本 {payload['items']} 篇；按 {payload['groupKey'] or '全部文献'} 分组推导。"
+    )
+    lines.append("这些是规则推断的候选空白，不是结论，请结合原文核实。")
+    for group in payload["groups"]:
+        lines.extend(["", f"## {group['name']}（{group['items']} 篇）", ""])
+        lines.append("### 方法 × 数据集：从未组合过")
+        lines.append("")
+        if group["emptyCells"]:
+            lines.append("| 方法 | 数据集 | 方法出现 | 数据集出现 |")
+            lines.append("| --- | --- | --- | --- |")
+            for row in group["emptyCells"]:
+                lines.append(
+                    f"| {row['method']} | {row['dataset']} | {row['methodCount']} | "
+                    f"{row['datasetCount']} |"
+                )
+            lines.append("")
+            lines.append("两边都有积累、却没有交叉，优先检查这些组合。")
+        else:
+            lines.append("没有发现明显空组合（或术语表覆盖不足）。")
+
+        lines.extend(["", "### 冷却的标签", ""])
+        if group["cooledTags"]:
+            lines.append("| 标签 | 最近年份 | 篇数 |")
+            lines.append("| --- | --- | --- |")
+            for row in group["cooledTags"]:
+                lines.append(f"| {md_cell(row['tag'])} | {row['lastYear']} | {row['count']} |")
+        else:
+            lines.append("没有长期停更的标签。")
+
+        lines.extend(["", "### 标注缺失（需人工补方法/数据集）", ""])
+        if group["unlabeled"]:
+            for row in group["unlabeled"]:
+                lines.append(f"- `{row['key']}` {row['title']}")
+        else:
+            lines.append("全部条目都识别到方法与数据集线索。")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_gaps(args: argparse.Namespace) -> None:
+    records = [record_from_item(item) for item in selected_items(args)]
+    if not records:
+        exit_with("No items matched the selection")
+    payload = gap_payload(
+        records,
+        min_freq=clamp_int(args.min_freq, 1, 20, 2),
+        prefix=grouping_prefix(records),
+    )
+    text = gap_markdown(payload)
+    if args.out:
+        path = Path(args.out).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    if args.json:
+        dump_json(payload)
+        return
+    print(text, end="")
+
+
+def add_selection_args(
+    parser: argparse.ArgumentParser, *, with_query: bool = True
+) -> None:
+    parser.add_argument("--keys", help="Comma-separated Zotero item keys")
+    if with_query:
+        parser.add_argument("--query", help="Match top-level items by title or author text")
+    parser.add_argument("--tag", help="Items carrying this tag")
+    parser.add_argument("--collection", help="Collection name or key")
+    parser.add_argument("--all", action="store_true", help="Every top-level item")
+    parser.add_argument("--limit", type=int, default=200, help="Maximum items to touch")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Operate Zotero Desktop local API and connector server."
@@ -1581,6 +3163,143 @@ def build_parser() -> argparse.ArgumentParser:
     daily_schedule.add_argument("--name", help=f"Task name, default {DAILY_TASK_NAME}")
     daily_schedule.add_argument("--remove", action="store_true", help="Delete the scheduled task")
     daily_schedule.set_defaults(func=cmd_daily_schedule)
+
+    authorize = subcommands.add_parser(
+        "authorize", help="Authorize local API writes (Zotero shows a permission dialog)"
+    )
+    authorize.add_argument("--app-name", default=WRITE_APP_NAME)
+    authorize.add_argument("--force", action="store_true", help="Request a fresh key")
+    add_json_flag(authorize)
+    authorize.set_defaults(func=cmd_authorize)
+
+    find_cmd = subcommands.add_parser(
+        "find", help="Find literature on OpenAlex, ranked by venue, citations, and recency"
+    )
+    find_cmd.add_argument("query", nargs="+", help="One or more queries")
+    find_cmd.add_argument("--from", dest="date_from", help="Start date YYYY-MM-DD")
+    find_cmd.add_argument("--to", dest="date_to", help="End date YYYY-MM-DD")
+    find_cmd.add_argument("--days", type=int, help="Look back N days instead of --from")
+    find_cmd.add_argument("--limit", type=int, default=20, help="Rows to keep (1-100)")
+    find_cmd.add_argument("--min-score", type=float, default=0.0)
+    find_cmd.add_argument("--oa", action="store_true", help="Only open-access works")
+    find_cmd.add_argument(
+        "--type", dest="work_type", choices=["article", "review", "preprint"]
+    )
+    find_cmd.add_argument("--include-preprints", action="store_true")
+    find_cmd.add_argument(
+        "--include-library", action="store_true", help="Keep works already in Zotero"
+    )
+    find_cmd.add_argument("--mailto", default="", help="Contact email for the OpenAlex pool")
+    find_cmd.add_argument("--bib", help="Write results as BibTeX to this file")
+    find_cmd.add_argument("--out", help="Write the JSON result list to this file")
+    find_cmd.add_argument(
+        "--import", dest="do_import", action="store_true", help="Import results via Connector"
+    )
+    find_cmd.add_argument("--yes", action="store_true")
+    add_json_flag(find_cmd)
+    find_cmd.set_defaults(func=cmd_find)
+
+    frontier = subcommands.add_parser(
+        "frontier", help="Track research fronts with saved watches"
+    )
+    frontier.add_argument("action", choices=["add", "list", "remove", "run"])
+    frontier.add_argument("name", nargs="?", help="Watch name")
+    frontier.add_argument("--query", action="append", help="Query for 'add' (repeatable)")
+    frontier.add_argument("--days", type=int, default=30, help="Window size in days")
+    frontier.add_argument("--max", type=int, default=10, help="Rows kept per watch")
+    frontier.add_argument("--include-preprints", action="store_true")
+    frontier.add_argument(
+        "--since-last", action="store_true", help="Start the window at the previous run"
+    )
+    frontier.add_argument("--import", dest="do_import", action="store_true")
+    frontier.add_argument("--yes", action="store_true")
+    frontier.add_argument("--mailto", default="")
+    frontier.add_argument("--out", help="Write the JSON report to this file")
+    add_json_flag(frontier)
+    frontier.set_defaults(func=cmd_frontier)
+
+    screen = subcommands.add_parser(
+        "screen", help="Screen candidates into 核心 / 重要 / 参考 tiers"
+    )
+    screen.add_argument("--input", help="JSON list from find/frontier (use - for stdin)")
+    screen.add_argument("--query", nargs="+", help="Run a fresh OpenAlex search first")
+    screen.add_argument("--library", action="store_true", help="Screen items already in Zotero")
+    screen.add_argument("--keys", help="Comma-separated item keys (with --library)")
+    screen.add_argument("--tag", help="Items carrying this tag (with --library)")
+    screen.add_argument("--collection", help="Collection name or key (with --library)")
+    screen.add_argument("--all", action="store_true", help="Every top-level item (with --library)")
+    screen.add_argument("--top", type=int, default=15, help="Rows to keep")
+    screen.add_argument("--min-score", type=float, default=0.0)
+    screen.add_argument("--limit", type=int, default=200, help="Items scanned in library mode")
+    screen.add_argument("--out", help="Write a Markdown shortlist to this file")
+    add_json_flag(screen)
+    screen.set_defaults(func=cmd_screen)
+
+    tag = subcommands.add_parser("tag", help="Add, remove, or replace tags on Zotero items")
+    add_selection_args(tag)
+    tag.add_argument("--add", help="Comma-separated tags to add")
+    tag.add_argument("--remove", help="Comma-separated tags to remove")
+    tag.add_argument("--replace", help="Comma-separated tags that replace the current set")
+    tag.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    tag.add_argument("--yes", action="store_true", help="Confirm the Zotero write")
+    tag.set_defaults(func=cmd_tag)
+
+    collect = subcommands.add_parser("collect", help="Add items to a collection (created on demand)")
+    collect.add_argument("name", help="Collection name (or key)")
+    add_selection_args(collect, with_query=True)
+    collect.add_argument("--parent", help="Parent collection name for a new subcollection")
+    collect.add_argument("--dry-run", action="store_true")
+    collect.add_argument("--yes", action="store_true")
+    collect.set_defaults(func=cmd_collect)
+
+    classify = subcommands.add_parser(
+        "classify", help="Derive method/dataset/venue rules and apply them as tags or collections"
+    )
+    add_selection_args(classify)
+    classify.add_argument("--apply", action="store_true", help="Write the plan to Zotero")
+    classify.add_argument("--by-year", action="store_true", help="Also tag year:<YYYY>")
+    classify.add_argument("--by-venue", action="store_true", help="Also collect per venue")
+    classify.add_argument("--no-method", action="store_true", help="Skip method tags")
+    classify.add_argument("--no-dataset", action="store_true", help="Skip dataset tags")
+    classify.add_argument("--tag-prefix", default="auto:")
+    classify.add_argument("--dry-run", action="store_true")
+    classify.add_argument("--yes", action="store_true")
+    add_json_flag(classify)
+    classify.set_defaults(func=cmd_classify)
+
+    dupes = subcommands.add_parser("dupes", help="Group duplicate items by DOI or normalized title")
+    add_selection_args(dupes)
+    dupes.add_argument("--trash", action="store_true", help="Move non-keeper copies to trash")
+    dupes.add_argument("--dry-run", action="store_true")
+    dupes.add_argument("--yes", action="store_true")
+    add_json_flag(dupes)
+    dupes.set_defaults(func=cmd_dupes)
+
+    digest = subcommands.add_parser(
+        "digest", help="Write a batch reading pack (one Markdown note per item)"
+    )
+    add_selection_args(digest)
+    digest.add_argument("--out", required=True, help="Output directory")
+    digest.add_argument("--fulltext", action="store_true", help="Add section outlines from PDF text")
+    add_json_flag(digest)
+    digest.set_defaults(func=cmd_digest)
+
+    landscape = subcommands.add_parser(
+        "landscape", help="Summarize years, venues, methods, and datasets for a selection"
+    )
+    add_selection_args(landscape)
+    landscape.add_argument("--out", help="Write the Markdown report to this file")
+    add_json_flag(landscape)
+    landscape.set_defaults(func=cmd_landscape)
+
+    gaps = subcommands.add_parser(
+        "gaps", help="Propose research gaps from method/dataset combinations and stale tags"
+    )
+    add_selection_args(gaps)
+    gaps.add_argument("--min-freq", type=int, default=2, help="Minimum term frequency to consider")
+    gaps.add_argument("--out", help="Write the Markdown report to this file")
+    add_json_flag(gaps)
+    gaps.set_defaults(func=cmd_gaps)
 
     return parser
 

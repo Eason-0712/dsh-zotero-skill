@@ -5,20 +5,23 @@
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
-让 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 直接操作你本机的 Zotero 文献库：检索论文、导出 BibTeX、给 LaTeX / Markdown 草稿插入引用，按需读取附件全文。
+让 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 把文献工作串成一条流水线：**找文献 → 追前沿 → 筛核心 → 管理归集 → 批量阅读 → 分类整理 → 提炼脉络 → 发现空白**，再加上导出 BibTeX 与给 LaTeX / Markdown 草稿插入引用。
 
 纯 Python 标准库实现，**不需要 pip、MCP 服务或 Zotero 云端 API Key**；默认只与本机 `127.0.0.1:23119` 通信。
 
 ## 特性
 
-- **检索**：按关键词搜索顶层条目，返回题名、作者、年份、item key 与 BibTeX key。
-- **浏览**：列出集合、标签、分组，或导出整个文献库清单。
-- **引用**：读取你指定的 `.tex` / `.md` 草稿，在唯一标记处插入 `\cite{key}` 或 Pandoc `[@key]`，并同步 `references.bib`。
-- **安全写入**：修改草稿或 `.bib` 前自动备份；`.bib` 按 key 去重，不重复追加。
-- **按需读取**：只有你明确要求时才读取附件路径或 PDF 全文，避免把本地路径和正文无谓地送进上下文。
-- **导入**：通过 Zotero Connector 导入 BibTeX / RIS，属于写库操作，脚本会用 `--yes` 显式确认。
-- **每日收录**：按你设定的主题，每天从 OpenAlex 抓取新论文，按期刊影响力、引用速度、相关度和新鲜度排序，自动导入指定分类；数量、开关、时间都由你决定。
-- **不碰数据库**：只走 Zotero 官方本地 API，不直接读写 `zotero.sqlite`。
+- **找文献**：从 OpenAlex 按主题检索，按期刊影响力、引用速度、相关度、新鲜度排序，并与本地库去重。
+- **追前沿**：把常读方向存成 watch，每次只拉「上次运行以来」的新论文，不重复推送。
+- **筛核心论文**：把候选或库内条目分成 核心 / 重要 / 参考 三档，输出可复制的短名单。
+- **管理文献**：批量打标签、归集到分类、按 DOI / 标题查重并清理副本。
+- **批量阅读**：一次为几十篇生成阅读包（元数据 + 摘要 + 章节大纲 + 笔记骨架），不必把原文全塞进上下文。
+- **分类整理**：从题名和摘要识别方法与数据集，生成 `auto:method:*` / `auto:dataset:*` 标签与集合计划，预览后写入。
+- **提炼脉络**：统计年份、期刊、方法、数据集及共现，直接产出综述可用的表格。
+- **发现空白**：按项目分组找「方法 × 数据集」从未交叉的组合、停更标签与标注缺失。
+- **检索与引用**：按关键词搜索条目，返回题名、作者、年份、item key 与 BibTeX key；在草稿唯一标记处插入 `\cite{key}` 或 `[@key]` 并同步 `.bib`。
+- **每日收录**：按主题每天从 OpenAlex 抓新论文，去重排序后自动导入指定分类，数量 / 开关 / 时间都由你决定。
+- **不碰数据库**：只走 Zotero 官方本地 API，不直接读写 `zotero.sqlite`；改库前先 `--dry-run`，写入需要你在 Zotero 弹窗里点一次「Always Allow」。
 
 ## 安装
 
@@ -95,13 +98,21 @@ python zotero/scripts/zotero.py status --json
 
 在 Harness 里直接说：
 
-> 检索我文献库中 transformer 相关的论文，给出作者、年份和 BibTeX 键。
+> 帮我找一下 knowledge distillation 用在运动想象 EEG 上的新论文，按重要性排个序。
+
+> 我常看的方向有这几个，做成 watch，以后只给我新出现的。
+
+> 从库里 project:MI-EEG 这 18 篇里挑出最核心的几篇，列个短名单。
+
+> 把这批论文生成阅读包，我看完再写综述。
+
+> 按方法和数据集给整个库打上标签，先给我看计划。
+
+> 这个方向现在有哪些明显的空白？
 
 > 读一下 `/path/to/draft.md`，把相关论断后面补上引用，并更新同目录的 references.bib。
 
-> 把这篇论文的附件全文读出来，总结方法部分。
-
-Skill 会自己决定调用哪些子命令，并在写文件前确认标记和备份。
+Skill 会自己决定调用哪些子命令，并在写库或写文件前先给预览。
 
 ## 每日自动收录
 
@@ -170,6 +181,17 @@ python zotero/scripts/zotero.py daily-schedule --remove
 | 命令 | 作用 |
 | --- | --- |
 | `status` | 检查本地 API、Connector、版本 |
+| `authorize` | 取得本地 API 写权限（Zotero 弹窗点「Always Allow」） |
+| `find <query>` | OpenAlex 检索并按分数排序，`--oa-only` / `--json` / `--out` |
+| `frontier add\|run\|list\|remove` | 保存研究方向，只拉上次之后的新论文 |
+| `screen` | 把候选或库内条目分成 核心 / 重要 / 参考 |
+| `tag` | 批量加 / 删 / 替换标签（`--dry-run`） |
+| `collect <name>` | 归集到分类，不存在则新建 |
+| `classify` | 识别方法与数据集，生成标签/集合计划，`--apply` 写入 |
+| `dupes` | 按 DOI 或标题查重，`--trash` 清理副本 |
+| `digest` | 批量生成阅读包（每篇一个 Markdown + index.md） |
+| `landscape` | 年份 / 期刊 / 方法 / 数据集统计与共现 |
+| `gaps` | 方法 × 数据集空组合、停更标签、标注缺失 |
 | `inventory` | 列出条目 |
 | `collections` / `tags` / `groups` | 列出集合、标签、分组 |
 | `search <query>` | 关键词检索，`--with-bibtex-keys` 附带引用键 |
@@ -186,7 +208,7 @@ python zotero/scripts/zotero.py daily-schedule --remove
 | `probe` | 探测各 API 路由可用性 |
 | `enable` / `disable` / `restart` | 管理本地 API 开关与启动 |
 
-所有命令加 `--json` 输出机器可读结果。
+所有命令加 `--json` 输出机器可读结果。批量选择统一用 `--keys`、`--query`、`--tag`、`--collection`、`--all`，`--limit` 限制条数。
 
 ## 目录结构
 
@@ -203,6 +225,7 @@ python zotero/scripts/zotero.py daily-schedule --remove
 │   └── scripts/zotero.py            # 全部功能，仅标准库
 ├── test/provider.test.mjs           # provider 的 Node 测试
 ├── tests/test_zotero.py             # 模拟 API 的 Python 单元测试
+├── tests/test_literature.py         # 术语抽取、分类计划、脉络、查重、空组合
 ├── install.py                       # 复制式安装器（方式 B）
 ├── LICENSE
 └── NOTICE.md
@@ -212,10 +235,12 @@ python zotero/scripts/zotero.py daily-schedule --remove
 
 ## 设计取舍
 
-- **只读本地 API**：检索、导出、全文都走 `/api/`；该接口本身只读，写操作交给 Connector。
+- **读写都走官方 API**：检索、导出、全文走 `/api/` 的 GET（免认证）；打标签、归集、查重清理走同一套本地 API 的 PATCH/POST，需要本地 API key 与 `Zotero-Server-ID`，脚本用 `authorize` 一次性取得并缓存，绝不直接改 `zotero.sqlite`。
+- **先预览再写入**：所有写命令都支持 `--dry-run`，Skill 要求先把计划给用户看，确认后才加 `--yes`。
+- **规则可解释**：方法 / 数据集识别是正则词表，分歧能被逐条检查；空组合与停更标签都是可复算的统计，而不是模型编的结论。
 - **写文件前备份**：`cite` 会先校验草稿和标记，再备份草稿与 `.bib`；`sync-bib` / `export-bibtex --out` 会覆盖目标文件，所以 Skill 要求先确认路径。
 - **本机请求绕过代理**：`localhost`、`127.0.0.1`、`::1` 直连，避免系统代理吞掉本机请求；非回环地址才走代理配置。
-- **UTF-8**：Windows 控制台下的中文 JSON 与路径不会乱码。
+- **UTF-8**：Windows 控制台下的中文 JSON 与路径不会乱码；`--input` 也能读 PowerShell 写出的 UTF-16 文件。
 - **不强制结束 Zotero**：需要改配置时要求先正常退出，避免 `prefs.js` 被覆盖。
 
 ## 测试
@@ -233,6 +258,9 @@ node --test test/*.test.mjs               # 插件 provider
 - 远端 / WSL / 容器里 `127.0.0.1` 指向的是运行环境本身，不在同一台机器上时无法直接连到桌面 Zotero。
 - `enable` / `disable` 只改本机 `prefs.js`，对远端 Zotero 无效。
 - 本地 API 的能力随 Zotero 版本变化，遇到 403 / 404 先检查开关和版本。
+- 写入需要你在 Zotero 弹窗里授权一次（选「Always Allow」才是持久的）；选「Allow」的 key 只能写一次。
+- 方法 / 数据集识别基于固定正则词表，冷门术语可能漏标；`gaps` 会把这些条目列成「标注缺失」供人工补。
+- `landscape` / `gaps` 的结论来自题录与摘要的统计，不是全文精读；写进论文前需要回头看原文。
 - 每日收录依赖 OpenAlex 的网络访问；离线或被限流时会跳过本次抓取，不会写坏文献库。
 - 收录只导入题录与摘要，不下载 PDF；需要全文时再按需获取。
 - 期刊指标来自 OpenAlex，与 JCR 影响因子不是同一套数据，仅用于相对排序。
@@ -248,6 +276,6 @@ node --test test/*.test.mjs               # 插件 provider
 
 ## English
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) skill for the local Zotero library: search items, export BibTeX, add citations to LaTeX/Markdown drafts, read attachment full text on demand, and fetch a ranked daily digest of new papers in your topics from OpenAlex.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) skill that runs the whole literature loop against your local Zotero library: find papers on OpenAlex, track research fronts with saved watches, screen candidates into core / important / reference tiers, manage items (batch tags, collections, DOI and title de-duplication), generate batch reading packs, classify items by method and dataset, chart the landscape of years / venues / methods / datasets, and surface candidate research gaps. It also exports BibTeX, inserts citations into LaTeX/Markdown drafts, and can run a ranked daily digest of new papers.
 
-Install by copying `zotero/` to `~/.dsh/skills/zotero` (or run `python install.py`), enable Zotero's local API, then ask your agent to search your library. For the daily digest, run `zotero.py daily-config --enable --topics "..."` and optionally `daily-schedule --time 08:00`. Adapted from OpenAI's Zotero plugin 0.1.2 under the MIT license.
+Install with `dsh plugin --profile <name> add dsh-zotero-skill` (or copy `zotero/` to `~/.dsh/skills/zotero`, or run `python install.py`), enable Zotero's local API, and run `zotero.py authorize` once if you want write operations. Adapted from OpenAI's Zotero plugin 0.1.2 under the MIT license.

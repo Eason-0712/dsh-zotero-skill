@@ -10,7 +10,7 @@ Important constraints:
 
 - Use `/api/users/0/...` for the local user by default.
 - Local API reads do not require an API key.
-- The local API is read-only; write requests are not supported there.
+- Local API **writes** (POST / PUT / PATCH / DELETE) require a local API key plus a `Zotero-Server-ID` header; see below.
 - Atom output is not supported locally.
 - Attachment file URLs and full text can expose local file paths or document text; only retrieve them when the user asks.
 
@@ -44,6 +44,18 @@ Safe read routes:
 /api/users/0/items/<attachmentKey>/fulltext
 /api/users/0/items/<attachmentKey>/file/view/url
 ```
+
+## Local API writes (tags, collections, duplicate cleanup)
+
+Write requests are supported but gated. The observed flow on Zotero 10.0.7:
+
+1. Every response carries `Zotero-Server-ID`. Writes must echo it back in a `Zotero-Server-ID` header, otherwise the server answers `428 Zotero-Server-ID not provided` (mismatch: `412`).
+2. Without a key: `401 API key required -- POST /api/local/authorize to obtain one`.
+3. `POST /api/local/authorize` with `{"appName": "<name>"}` opens a Zotero dialog with **Allow** (single-use key, consumed by the first successful write), **Always Allow** (`remember: true`, persistent) and **Deny**. The response is `{"key": "...", "remember": false|true}`.
+4. Send the key as `Zotero-API-Key: <key>` on PATCH/POST/DELETE. Include `If-Unmodified-Since-Version: <item version>` to avoid clobbering concurrent edits.
+5. Send JSON bodies from a file (`curl --data-binary "@body.json"`); shell-quoted JSON is easily mangled into `Invalid JSON provided`.
+
+`zotero.py authorize` performs step 3, caches `{key, serverId}` in `~/.zotero-skill/local-key.json`, and every write command (`tag`, `collect`, `classify --apply`, `dupes --trash`) handles steps 1, 2 and 4 automatically, re-authorizing on 401. Never edit `zotero.sqlite` directly.
 
 ## Connector server
 

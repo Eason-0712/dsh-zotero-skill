@@ -1,7 +1,7 @@
 {
   "name": "dsh-zotero-skill",
-  "version": "0.2.0",
-  "description": "Zotero skill for DeepSeek Harness: search the local library, export BibTeX, cite into LaTeX/Markdown drafts, and import a ranked daily digest of new papers from OpenAlex.",
+  "version": "0.3.0",
+  "description": "Zotero skill for DeepSeek Harness: find papers on OpenAlex, track research fronts, screen core papers, manage and classify the library, batch-read, map the landscape, and surface research gaps. Also exports BibTeX and cites into LaTeX/Markdown.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -49,6 +49,9 @@
     "zotero",
     "skill",
     "bibtex",
-    "citation"
+    "citation",
+    "literature-review",
+    "openalex",
+    "research"
   ]
 }
