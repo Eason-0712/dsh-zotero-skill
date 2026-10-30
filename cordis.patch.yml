@@ -6,6 +6,7 @@
 # installed — no copy into ~/.dsh/skills or ~/.agents/skills.
 #
 # Install:
+#   dsh plugin --profile <name> add dsh-zotero-skill
 #   dsh plugin --profile <name> add github:Eason-0712/dsh-zotero-skill
 #
 # Local development (link to a checkout):

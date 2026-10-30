@@ -1,5 +1,6 @@
 # Zotero Skill for DeepSeek Harness
 
+[![npm](https://img.shields.io/npm/v/dsh-zotero-skill.svg)](https://www.npmjs.com/package/dsh-zotero-skill)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -33,7 +34,13 @@
 
 **方式 A：作为 DSH 插件安装（推荐）**
 
-仓库自带 `dsh.bundle` 清单，装成插件后 skill 自动出现在技能目录，不需要复制文件：
+包已发布到 npm，自带 `dsh.bundle` 清单，装成插件后 skill 自动出现在技能目录，不需要复制文件：
+
+```bash
+dsh plugin --profile <你的 profile> add dsh-zotero-skill
+```
+
+想跟最新代码，或 npm 不可达时，可直接从 GitHub 安装：
 
 ```bash
 dsh plugin --profile <你的 profile> add github:Eason-0712/dsh-zotero-skill

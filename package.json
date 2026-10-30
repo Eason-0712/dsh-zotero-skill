@@ -11,18 +11,24 @@
   "files": [
     "lib/**/*.js",
     "zotero/**",
+    "!**/__pycache__/**",
+    "!**/*.pyc",
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
     "NOTICE.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "prepublishOnly": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=20"
