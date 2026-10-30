@@ -187,7 +187,7 @@ python zotero/scripts/zotero.py daily-schedule --remove
 | `screen` | 把候选或库内条目分成 核心 / 重要 / 参考 |
 | `tag` | 批量加 / 删 / 替换标签（`--dry-run`） |
 | `collect <name>` | 归集到分类，不存在则新建 |
-| `classify` | 按维度（类型/方法/数据集/年份/期刊/主题/项目）建文件夹并归入，或生成标签计划；`--apply` 写入 |
+| `classify` | 建文件夹：`方向 / 维度 / 取值`，方向取 `project:` 标签并可 `--rename` 改名；也可生成标签计划；`--apply` 写入 |
 | `dupes` | 按 DOI 或标题查重，`--trash` 清理副本 |
 | `digest` | 批量生成阅读包（每篇一个 Markdown + index.md） |
 | `landscape` | 年份 / 期刊 / 方法 / 数据集统计与共现 |

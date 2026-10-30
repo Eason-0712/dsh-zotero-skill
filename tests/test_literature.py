@@ -227,7 +227,7 @@ class CollectionFolderTests(unittest.TestCase):
             dict(record('K1', 'A study'), methods=['transformer', 'cnn']),
             dict(record('K2', 'B study'), methods=['cnn']),
         ]
-        groups = z.collection_plan(records, ['method'], root='文献分类')
+        groups = z.collection_plan(records, ['method'], root='文献分类', group='none')
         by_value = {group['value']: group for group in groups}
         self.assertEqual(sorted(by_value), ['cnn', 'transformer'])
         self.assertEqual(by_value['cnn']['path'], ['文献分类', '方法', 'cnn'])
@@ -276,7 +276,32 @@ class CollectionFolderTests(unittest.TestCase):
 
     def test_markdown_lists_folders_and_counts(self):
         records = [dict(record('K1', 'A study'), methods=['cnn'])]
-        groups = z.collection_plan(records, ['method'])
-        text = z.collection_plan_markdown(groups, 1, root='文献分类')
+        groups = z.collection_plan(records, ['method'], root='文献分类', group='none')
+        text = z.collection_plan_markdown(groups, 1, root='文献分类', group='none')
         self.assertIn('文献分类 / 方法 / cnn', text)
         self.assertIn('1 个文件夹', text)
+
+    def test_group_level_uses_project_and_rename(self):
+        records = [
+            dict(record('K1', 'A study', tags=['project:MI-EEG']), methods=['cnn']),
+            dict(record('K2', 'B study', tags=['project:BIN-PICKING']), methods=['grasping']),
+        ]
+        groups = z.collection_plan(
+            records, ['method'], rename={'MI-EEG': 'AI脑电解码', 'BIN-PICKING': '智能分拣'}
+        )
+        paths = sorted(group['path'] for group in groups)
+        self.assertEqual(paths, [['AI脑电解码', '方法', 'cnn'], ['智能分拣', '方法', 'grasping']])
+
+    def test_group_level_drops_when_nothing_tagged(self):
+        records = [dict(record('K1', 'A study'), methods=['cnn'])]
+        groups = z.collection_plan(records, ['method'])
+        self.assertEqual(groups[0]['path'], ['方法', 'cnn'])
+
+    def test_parse_renames(self):
+        self.assertEqual(
+            z.parse_renames('MI-EEG=AI脑电解码; BIN-PICKING=智能分拣'),
+            {'MI-EEG': 'AI脑电解码', 'BIN-PICKING': '智能分拣'},
+        )
+        self.assertEqual(z.parse_renames(''), {})
+        with self.assertRaises(SystemExit):
+            z.parse_renames('broken')

@@ -98,15 +98,18 @@ description: 面向科研文献全流程的 Zotero 技能：找文献、追前�
 **A. 建文件夹（用户说「按论文类型/方法/数据集分类建目录」时用这个）**
 
 ```text
-<python> "<skill-dir>/scripts/zotero.py" classify --all --by type,method,dataset
-<python> "<skill-dir>/scripts/zotero.py" classify --tag "project:MI-EEG" --by method --root 我的课题 --apply --yes
+<python> "<skill-dir>/scripts/zotero.py" classify --all --by type,method
+<python> "<skill-dir>/scripts/zotero.py" classify --all --by type,method,dataset --rename "MI-EEG=AI脑电解码,BIN-PICKING=智能分拣"
+<python> "<skill-dir>/scripts/zotero.py" classify --all --by method --group none --root 方法库 --apply --yes
 ```
 
-- 结构固定为 `根目录 / 维度 / 取值`，默认根目录 `文献分类`，可用 `--root` 改名（可先用 `collect` 或 Zotero 界面建好根目录，再让 `--root` 指向它）。
-- 可用维度：`type`（期刊论文 / 会议论文 / 预印本 / 学位论文 / 综述…）、`method`、`dataset`、`year`、`venue`、`topic`（读 `topic:` 标签）、`project`（读 `project:` 标签）；逗号分开可一次建多层。
-- 一个条目可以同时落在多个文件夹（Zotero 原生支持），不会互相覆盖。
-- 已有同名文件夹会复用，不会重复创建；`--include-unclassified` 把该维度缺失的条目并入 `未标注`。
-- 标题含 review/survey/overview/tutorial/meta-analysis 的会在 `类型` 下额外进 `综述`。
+- 目录结构是 `方向 / 维度 / 取值` 三层：**方向**取自 `project:` 标签（用户的研究大方向），默认根目录为空，即直接在库里出现 `AI脑电解码 / 方法 / transformer`。
+- `--group project`（默认）决定第一层用哪个维度；`--group topic|method|dataset` 可换，`--group none` 关掉第一层。整个选区都没有该维度标签时会自动省略第一层，不会产生「未分组」。
+- `--rename "旧=新,旧=新"` 把标签值换成用户习惯的叫法（如 `MI-EEG → AI脑电解码`），只影响文件夹名，不改标签。
+- `--root 名称` 在最外层再加一层（默认不加）。
+- 可用维度：`type`（期刊论文 / 会议论文 / 预印本 / 学位论文 / 综述…）、`method`、`dataset`、`year`、`venue`、`topic`、`project`；逗号分开可一次建多层。
+- 一个条目可以同时落在多个文件夹（Zotero 原生支持），不会互相覆盖；已有同名文件夹复用，重复运行幂等。
+- `--include-unclassified` 把该维度缺失的条目并入 `未标注`。
 
 **B. 打标签（默认）**
 

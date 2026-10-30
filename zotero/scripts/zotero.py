@@ -2406,6 +2406,7 @@ DIMENSION_ALIASES = {
 }
 
 UNCLASSIFIED = "未标注"
+UNGROUPED = "未分组"
 
 
 def dimension_values(record: dict[str, Any], dimension: str) -> list[str]:
@@ -2455,59 +2456,120 @@ def parse_dimensions(raw: str | None) -> list[str]:
     return dimensions
 
 
+def parse_renames(raw: str | None) -> dict[str, str]:
+    """Parse `MI-EEG=AI脑电解码,BIN-PICKING=智能分拣` into a rename table."""
+    table: dict[str, str] = {}
+    for item in split_csv(raw):
+        if "=" not in item:
+            exit_with(f"Bad --rename entry: {item} (expected old=new)")
+        old, new = item.split("=", 1)
+        old, new = old.strip(), new.strip()
+        if old and new:
+            table[old] = new
+    return table
+
+
 def collection_plan(
     records: list[dict[str, Any]],
     dimensions: list[str],
     *,
-    root: str = "文献分类",
+    root: str = "",
+    group: str = "project",
     include_unclassified: bool = False,
+    rename: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Group records into `root / dimension-label / value` folders."""
+    """Group records into `[root /] group / dimension-label / value` folders.
+
+    `group` is the top-level research direction (usually the `project:` tag);
+    pass `"none"` to skip that level.
+    """
+    renames = dict(rename or {})
+    use_group = bool(group) and group != "none"
+    if use_group:
+        # Drop the direction level when nothing in this selection carries it,
+        # so an untagged library still yields a clean dimension/value tree.
+        use_group = any(dimension_values(record, group) for record in records)
+    buckets: dict[tuple[str | None, str, str], list[str]] = {}
+    missing: dict[tuple[str | None, str], list[str]] = {}
+
+    for record in records:
+        key = str(record.get("key") or "")
+        group_values: list[str | None] = [None]
+        if use_group:
+            found = [value for value in dimension_values(record, group) if value]
+            group_values = list(dict.fromkeys(found)) if found else [UNGROUPED]
+        for group_value in group_values:
+            for dimension in dimensions:
+                values = [v for v in dimension_values(record, dimension) if v]
+                if not values:
+                    missing.setdefault((group_value, dimension), []).append(key)
+                    continue
+                for value in dict.fromkeys(values):
+                    buckets.setdefault((group_value, dimension, value), []).append(key)
+
+    dimension_order = {name: index for index, name in enumerate(dimensions)}
     groups: list[dict[str, Any]] = []
-    for dimension in dimensions:
-        label = DIMENSION_LABELS[dimension]
-        buckets: dict[str, list[str]] = {}
-        empty: list[str] = []
-        for record in records:
-            key = str(record.get("key") or "")
-            values = [value for value in dimension_values(record, dimension) if value]
-            if not values:
-                empty.append(key)
-                continue
-            for value in dict.fromkeys(values):
-                buckets.setdefault(value, []).append(key)
-        for value in sorted(buckets):
+    for (group_value, dimension, value), keys in sorted(
+        buckets.items(),
+        key=lambda item: (
+            str(item[0][0] or ""),
+            dimension_order.get(item[0][1], 99),
+            item[0][2],
+        ),
+    ):
+        path: list[str] = []
+        if root:
+            path.append(root)
+        if group_value:
+            path.append(renames.get(group_value, group_value))
+        path.append(DIMENSION_LABELS[dimension])
+        path.append(renames.get(value, value))
+        groups.append(
+            {
+                "group": group_value,
+                "dimension": dimension,
+                "label": DIMENSION_LABELS[dimension],
+                "value": value,
+                "path": path,
+                "items": list(dict.fromkeys(keys)),
+            }
+        )
+
+    if include_unclassified:
+        for (group_value, dimension), keys in sorted(
+            missing.items(), key=lambda item: (str(item[0][0] or ""), item[0][1])
+        ):
+            path = []
+            if root:
+                path.append(root)
+            if group_value:
+                path.append(renames.get(group_value, group_value))
+            path.extend([DIMENSION_LABELS[dimension], UNCLASSIFIED])
             groups.append(
                 {
+                    "group": group_value,
                     "dimension": dimension,
-                    "label": label,
-                    "value": value,
-                    "path": [root, label, value],
-                    "items": list(dict.fromkeys(buckets[value])),
-                }
-            )
-        if include_unclassified and empty:
-            groups.append(
-                {
-                    "dimension": dimension,
-                    "label": label,
+                    "label": DIMENSION_LABELS[dimension],
                     "value": UNCLASSIFIED,
-                    "path": [root, label, UNCLASSIFIED],
-                    "items": list(dict.fromkeys(empty)),
+                    "path": path,
+                    "items": list(dict.fromkeys(keys)),
                 }
             )
     return groups
 
 
 def collection_plan_markdown(
-    groups: list[dict[str, Any]], total: int, *, root: str
+    groups: list[dict[str, Any]], total: int, *, root: str = "", group: str = ""
 ) -> str:
     folders = len(groups)
-    touched = len({key for group in groups for key in group["items"]})
+    touched = len({key for group_ in groups for key in group_["items"]})
+    shape = " / ".join(
+        [part for part in [root, "方向" if group and group != "none" else "", "维度", "取值"] if part]
+    )
     lines = [
         f"# 分类整理计划 · 文件夹（{total} 篇 → {folders} 个文件夹，覆盖 {touched} 篇）",
         "",
-        f"根目录：`{root}`，结构为 `{root} / 维度 / 取值`；同一个条目可以同时进多个文件夹。",
+        f"结构：`{shape}`；同一个条目可以同时进多个文件夹。",
         "",
         "只预览，不写入。加 `--apply --yes` 才会在 Zotero 里真的建文件夹并归入条目。",
         "",
@@ -2646,12 +2708,16 @@ def cmd_classify(args: argparse.Namespace) -> None:
 
     dimensions = parse_dimensions(getattr(args, "by", "") or "")
     if dimensions:
-        root = getattr(args, "root", None) or "文献分类"
+        root = getattr(args, "root", None) or ""
+        group = getattr(args, "group", None) or "project"
+        rename = parse_renames(getattr(args, "rename", None))
         groups = collection_plan(
             records,
             dimensions,
             root=root,
+            group=group,
             include_unclassified=bool(getattr(args, "include_unclassified", False)),
+            rename=rename,
         )
         if not groups:
             exit_with(
@@ -2664,13 +2730,19 @@ def cmd_classify(args: argparse.Namespace) -> None:
                     {
                         "mode": "collections",
                         "root": root,
+                        "group": group,
+                        "rename": rename,
                         "items": len(records),
                         "folders": len(groups),
                         "groups": groups,
                     }
                 )
                 return
-            print(collection_plan_markdown(groups, len(records), root=root))
+            print(
+                collection_plan_markdown(
+                    groups, len(records), root=root, group=group
+                )
+            )
             return
         ensure_yes(args, "create Zotero collections")
         results = apply_collection_plan(groups, dry_run=args.dry_run)
@@ -2678,6 +2750,7 @@ def cmd_classify(args: argparse.Namespace) -> None:
             {
                 "mode": "collections",
                 "root": root,
+                "group": group,
                 "items": len(records),
                 "folders": len(groups),
                 "changed": sum(1 for row in results if row.get("changed")),
@@ -3592,7 +3665,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     classify.add_argument(
-        "--root", default="文献分类", help="Root folder name used with --by"
+        "--root",
+        default="",
+        help="Optional extra top folder above the research direction (default: none)",
+    )
+    classify.add_argument(
+        "--group",
+        default="project",
+        help=(
+            "Top-level research direction dimension: project (default), topic, "
+            "method, dataset, or none"
+        ),
+    )
+    classify.add_argument(
+        "--rename",
+        default="",
+        help="Rename folder values, e.g. \"MI-EEG=AI脑电解码,BIN-PICKING=智能分拣\"",
     )
     classify.add_argument(
         "--include-unclassified",
