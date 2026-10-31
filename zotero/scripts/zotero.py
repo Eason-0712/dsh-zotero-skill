@@ -50,7 +50,7 @@ class Response:
 
     @property
     def content_type(self) -> str:
-        return self.headers.get("Content-Type", "")
+        return next((value for key, value in self.headers.items() if key.lower() == "content-type"), "")
 
 
 def dump_json(value: Any) -> None:
@@ -387,7 +387,7 @@ def count_bibtex_entries(text: str) -> int:
 
 
 def total_results(response: Response) -> int | None:
-    raw = response.headers.get("Total-Results")
+    raw = next((value for key, value in response.headers.items() if key.lower() == "total-results"), None)
     return int(raw) if raw and raw.isdigit() else None
 
 
@@ -3732,6 +3732,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(gaps)
     gaps.set_defaults(func=cmd_gaps)
 
+    # Lazy optional reading workflow; existing metadata commands stay stdlib-only.
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from paper_reader.cli import register
+    register(subcommands, sys.modules[__name__])
     return parser
 
 

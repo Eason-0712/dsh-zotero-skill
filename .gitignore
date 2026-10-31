@@ -6,6 +6,8 @@ __pycache__/
 # 本地运行产物
 tmp/
 *.zip
+*.xpi
+*.tgz
 *.zotero-skill-backup-*
 
 # 编辑器 / 系统

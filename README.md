@@ -8,9 +8,66 @@
 
 让 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 把文献工作串成一条流水线：**找文献 → 追前沿 → 筛核心 → 管理归集 → 批量阅读 → 分类整理 → 提炼脉络 → 发现空白**，再加上导出 BibTeX 与给 LaTeX / Markdown 草稿插入引用。
 
-纯 Python 标准库实现，**不需要 pip、MCP 服务或 Zotero 云端 API Key**；默认只与本机 `127.0.0.1:23119` 通信。
+基础文献管理由 Python 标准库实现，**不需要 MCP 服务或 Zotero 云端 API Key**。Zotero 操作默认连接本机 `127.0.0.1:23119`；论文发现访问 OpenAlex。全文阅读工作流的本地 PDF/OCR 组件首次按需下载，后续复用；分析与翻译使用 DSH 当前模型配置。
+
+## 0.5：全文阅读与可复用的综述证据
+
+在 DSH 中说「精读 Zotero 当前选中的论文」或「比较这个分类中的论文」。插件先展示本次输出、快速/深入模式、讲解深度、PDF 版式、优先内容和执行方式。可保存常用设置和多个研究课题档案；通用插件不预设研究领域。
+
+- **译文与精读**：同一份已接受结果用于 Markdown、Zotero 中文笔记、标注 PDF 和双语 PDF。完整翻译覆盖摘要、正文和实质性附录。精读协议要求说明章节逻辑、方法与公式、实验和消融、贡献、局限及实践步骤。
+- **原文依据**：每条分析带块 ID、页码和可匹配的原文片段，分别标记原文报告、分析解释和待验证建议。校验定位不等于自动证明科学结论正确。
+- **可选版式**：左右、上下、原文页后跟译页；简洁/详细高亮和中文批注。保留原始页面，较长译文增加续页；识别到的栅格图、表格和公式复制到译文页。复杂矢量图以保留的原文页为准。
+- **可恢复与复用**：按源文件指纹缓存 PDF 解析；分批接受译文和分析，显示缺少的块与分析项。完整导出会检查覆盖与源文件变化；显式部分导出只生成带未完成标记的 Markdown。新版导出不覆盖手工修改的旧文件。
+- **综述与推荐**：复用单篇证据进行方法、实验协议、结果、局限和实现条件的比较，列出已有材料不足，自动检索带推荐理由的补充候选。候选仅有题录/摘要时明确标明；研究空白保持为待验证假设。
+- **省用量默认**：当前会话顺序处理；用户可选 DSH 内置、继承当前模型配置的受限并行。没有子任务能力时回到顺序处理，不配置额外模型 API。
+
+### 首次准备与当前选中条目
+
+Node 20+ 是 DSH 插件的运行前提。包内启动器准备私有 Python 3.12、PDF、OCR 和可嵌入的 Noto 中文字体，不改变系统 Python：
+
+```bash
+node lib/reader-runner.js reader-config
+node lib/reader-runner.js bridge --out dsh-reader.xpi
+```
+
+「当前选中论文」需要将生成的配套扩展在 Zotero 的 **工具 → 插件 → 从文件安装**中安装一次，然后运行已有 `authorize` 流程。扩展要求 Zotero 10 的本地 API 鉴权能力，继承 Zotero 的 API key/server-id 检查，不新增服务或凭据。分类、标签、关键词与明确 item key 无需此扩展。
+
+首次组件下载需要网络，输出进度，后续缓存复用。uv 启动器与字体锁定下载地址和 SHA256；Python 组件安装到私有环境。Noto 字体许可证见 `zotero/references/Noto-OFL.txt`；新模块选用非 AGPL 的 PDF 依赖。Windows 为主要使用环境，macOS/Linux 同样提供运行时映射，仍需各平台实际验证。
+
+### 阅读命令
+
+```bash
+# 实际使用由 DSH 根据用户选择运行，无需用户自己编写分析 JSON
+node lib/reader-runner.js read prepare --selected --outputs notes translation annotated-pdf bilingual-pdf zotero-note --mode deep --layout side-by-side
+node lib/reader-runner.js read prepare --collection COLLECTIONKEY --outputs notes --depth beginner
+node lib/reader-runner.js read status read-JOBID
+# 当前 DSH 模型读取任务、写出结构化结果后：
+node lib/reader-runner.js read accept read-JOBID --input result.json
+node lib/reader-runner.js read export read-JOBID --out reading
+node lib/reader-runner.js read publish read-JOBID --yes
+```
+
+使用 `reader-config --input settings.json` 保存配置，`research-profile NAME --input profile.json` 保存课题档案，`read list` 列出可复用任务；`review prepare/render/search` 用于跨论文比较与自动补充检索。协议与 JSON 格式见 [reading-workflow.md](zotero/references/reading-workflow.md) 和 [review-workflow.md](zotero/references/review-workflow.md)。
+
+**验证边界**：已提供离线 PDF、引用、覆盖、缓存、布局及接口契约测试；未在使用者的 Windows DSH/Zotero 实例完成端到端验证。10–15 页文字型论文首分钟有实质内容、3–5 分钟完成是待测性能目标，模型速度、所选输出、OCR 与首次下载会影响耗时。现有 `digest` 仍是元数据阅读包，不是本流程的模型精读结果。
 
 ## 特性
+
+### 轻量阅读增强
+
+参考 [11 个代表性文献工具的官方资料](docs/reader-market-choices.md)，本轮加入以下按需能力，继续使用 DSH 对话与 Zotero 原界面：
+
+- **聚焦问答**：在选定论文中本地检索少量片段，复用当前模型解释方法、公式或差异；答案带原文定位，证据不足与相互冲突明确区分。使用标准库 SQLite FTS5，无需嵌入模型或向量数据库。
+- **原生批注**：把有原文依据的高亮和中文评论写入 Zotero annotation 条目，笔记可点击回到该高亮；已有评论有变化时保留并报告。也可读取用户现有批注作为后续阅读疑问。
+- **证据对比表**：自定义提取列，每格区分原文报告、分析解释、未报告和不可比；来源必须属于该行论文。输出 Markdown/CSV 和证据 JSON，不新增表格服务。
+- **术语与数字复核**：研究档案可保存术语表；检查译文数字、百分比、遗漏术语与疑似未翻译长段，支持可选严格接受。确定性复核不代替科学正确性判断。
+- **逐段对照与导航**：新增 `bilingual-markdown`，按原文段落紧接中文译文，附原页链接；PDF 书签或明确标记的章节线索帮助定位，适合窄屏阅读。
+- **纠错与复用**：带当前修订号和理由更正已有译文/解释，保留快照；旧问答、对比表或综述在资料修正后失效，避免继续复用过时结论。
+- **引用追踪**：从选定论文出发获取有限的一跳参考/被引候选，显示关联来源、截断范围和 OpenAlex 撤稿标记；关系本身不代表支持或质量，也不自动导入为可信证据。
+
+这些能力没有新增第三方依赖、独立前端或常驻服务。执行协议见 [focused-reading.md](zotero/references/focused-reading.md)；普通使用者仍可用自然语言提出任务，不需要手写 JSON。
+
+### 既有文献工作流
 
 - **找文献**：从 OpenAlex 按主题检索，按期刊影响力、引用速度、相关度、新鲜度排序，并与本地库去重。
 - **追前沿**：把常读方向存成 watch，每次只拉「上次运行以来」的新论文，不重复推送。
@@ -223,7 +280,7 @@ python zotero/scripts/zotero.py daily-schedule --remove
 │   ├── references/
 │   │   ├── deepseek-harness.md      # 安装、连接排查、环境变量
 │   │   └── local-api-routes.md      # 本地 API 与 Connector 路由
-│   └── scripts/zotero.py            # 全部功能，仅标准库
+│   └── scripts/                    # zotero.py 基础 CLI；paper_reader/ 全文工作流
 ├── test/provider.test.mjs           # provider 的 Node 测试
 ├── tests/test_zotero.py             # 模拟 API 的 Python 单元测试
 ├── tests/test_literature.py         # 术语抽取、分类计划、脉络、查重、空组合
