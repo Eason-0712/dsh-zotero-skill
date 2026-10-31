@@ -202,6 +202,8 @@ class ReadingToolsTests(unittest.TestCase):
         self.assertEqual(len(result['files']), 3)
         with (self.root / 'comparison.csv').open(newline='') as stream:
             rows = list(csv.reader(stream))
+        self.assertNotIn(b'\r\r\n', (self.root / 'comparison.csv').read_bytes())
+        self.assertEqual(len(rows), 2)
         self.assertTrue(rows[1][0].startswith("'="))
         text = (self.root / 'comparison.md').read_text()
         self.assertIn('[未报告]', text); self.assertIn('zotero://open-pdf/', text)

@@ -196,5 +196,6 @@ def md(value):
 def write_new(path, value):
     path = Path(path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as stream:
+    # CSV already carries CRLF; Windows must not translate it to CR-CR-LF.
+    with path.open("x", encoding="utf-8", newline="") as stream:
         stream.write(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
