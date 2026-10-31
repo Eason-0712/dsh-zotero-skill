@@ -1,6 +1,7 @@
 # Zotero Skill for DeepSeek Harness
 
 [![npm](https://img.shields.io/npm/v/dsh-zotero-skill.svg)](https://www.npmjs.com/package/dsh-zotero-skill)
+[![npm downloads](https://img.shields.io/npm/dm/dsh-zotero-skill.svg)](https://www.npmjs.com/package/dsh-zotero-skill)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
