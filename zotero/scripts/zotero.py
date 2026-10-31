@@ -3732,6 +3732,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(gaps)
     gaps.set_defaults(func=cmd_gaps)
 
+    # Lazy optional reading workflow; existing metadata commands stay stdlib-only.
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from paper_reader.cli import register
+    register(subcommands, sys.modules[__name__])
     return parser
 
 

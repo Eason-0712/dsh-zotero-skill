@@ -1,6 +1,6 @@
 ---
 name: zotero
-description: 面向科研文献全流程的 Zotero 技能：找文献、追前沿、筛核心论文、管理文献（打标签/归集/查重）、批量阅读、分类整理、提炼脉络、发现空白，并支持导出 BibTeX 与给 LaTeX/Markdown 草稿插入引用。用户提到 Zotero、找文献、查文献、前沿、综述、批量读论文、文献整理或研究空白时使用。
+description: 面向不同研究领域的 Zotero 技能：全文翻译、有原文依据的精读、PDF 高亮与中文批注、可选版式的双语 PDF、Markdown 与 Zotero 笔记、多篇比较、综述和补充文献推荐；另有检索、归集、分类、BibTeX 与草稿引用。用户提到 Zotero、论文翻译、精读、标注、综述、文献整理或研究空白时使用。
 ---
 
 # Zotero · DeepSeek Harness
@@ -25,6 +25,18 @@ description: 面向科研文献全流程的 Zotero 技能：找文献、追前�
 - 不要直接读写 `zotero.sqlite`，也不要绕过本地 API 改文件。
 
 ## 八项能力
+
+## 全文翻译、精读、标注与综述（优先入口）
+
+用户要求全文翻译、深入阅读、重点高亮、双语 PDF、多篇比较或综述时，先读取
+[references/reading-workflow.md](references/reading-workflow.md)。先展示本次输出、深度、版式、优先内容和执行方式，允许保存设置。
+使用宿主当前模型生成，一份分析与译文复用于 Markdown、Zotero 笔记和 PDF；默认省用量，用户可选继承当前模型配置的受限并行。
+通过 `read prepare/accept/status/export/publish` 建立可恢复、可定位到原文的阅读任务；多篇综述用 `review prepare/render/search`，材料不足时明确不足并自动搜索带理由的补充候选。
+运行入口为技能资源目录内 `scripts/reader-runner.mjs`（Node 20+），包安装也提供 `lib/reader-runner.js`；首次按需准备本地 Python/PDF/OCR 组件，现有 Python CLI 也保留。
+当前选中论文需安装包内配套 Zotero 扩展；分类、标签、检索和明确 item key 继续使用已有 API。
+不把元数据模板当成精读结论，不把局部语料统计当成已证明的研究空白，不承诺未经实测的完成时间。
+
+以下命令仍可用于基础查询、归集和统计；`digest` 是阅读包生成器。
 
 ### 1. 找文献 `find`
 
