@@ -18,7 +18,7 @@ CHOICES = {
     "annotation": {"concise", "detailed"}, "priority": {"card", "notes", "translation"},
     "execution": {"economy", "parallel"},
 }
-OUTPUTS = {"notes", "translation", "annotated-pdf", "bilingual-pdf", "zotero-note"}
+OUTPUTS = {"notes", "translation", "annotated-pdf", "bilingual-pdf", "bilingual-markdown", "zotero-note"}
 
 
 def root():
@@ -109,4 +109,5 @@ def profile(name):
     record = read(root() / "reader-profiles" / (identifier(name) + ".json"))
     if record is None:
         raise ValueError(f"Unknown research profile: {name}")
-    return record
+    from .quality import profile_fields
+    return profile_fields(record)

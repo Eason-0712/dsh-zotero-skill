@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import zipfile
-from . import storage as s, jobs, review
+from . import storage as s, jobs, review, evidence, matrix, native, quality, discovery
 
 
 def register(subcommands, api):
@@ -31,19 +31,37 @@ def register(subcommands, api):
     prepare.add_argument("--profile")
     prepare.add_argument("--max-workers", type=int)
     prepare.set_defaults(func=lambda args: dispatch("prepare", args, api))
-    for name in ("status", "accept", "export", "publish"):
+    for name in ("status", "accept", "revise", "history", "audit", "outline", "annotations", "annotate", "export", "publish"):
         command = commands.add_parser(name)
         command.add_argument("job")
-        if name == "accept":
+        if name in {"accept", "revise"}:
             command.add_argument("--input", required=True)
+        if name == "accept":
+            command.add_argument("--strict", action="store_true", help="Require number/glossary audit to pass")
+        if name == "revise":
+            command.add_argument("--expected-revision", required=True)
+            command.add_argument("--reason", required=True)
         if name == "export":
             command.add_argument("--out", required=True)
             command.add_argument("--partial", action="store_true", help="Export explicitly incomplete Markdown only")
-        if name == "publish":
+        if name in {"publish", "annotate"}:
             command.add_argument("--yes", action="store_true")
         command.set_defaults(func=lambda args, action=name: dispatch(action, args, api))
     listing = commands.add_parser("list")
     listing.set_defaults(func=lambda args: dispatch("list", args, api))
+    ask = commands.add_parser("ask", help="Retrieve a small, scoped passage context for the current host model")
+    ask.add_argument("--jobs", nargs="+", required=True)
+    ask.add_argument("--question", required=True)
+    ask.add_argument("--query", help="Optional English keywords for cross-language lexical retrieval")
+    ask.add_argument("--profile", default="")
+    ask.add_argument("--max-chars", type=int, default=10000)
+    ask.add_argument("--out", required=True)
+    ask.set_defaults(func=lambda args: dispatch("ask", args, api))
+    answer = commands.add_parser("answer")
+    answer.add_argument("--context", required=True)
+    answer.add_argument("--input", required=True)
+    answer.add_argument("--out", required=True)
+    answer.set_defaults(func=lambda args: dispatch("answer", args, api))
 
     corpus = subcommands.add_parser("review", help="Reuse accepted paper evidence for comparison and gap-directed search")
     actions = corpus.add_subparsers(dest="review_action", required=True)
@@ -63,6 +81,25 @@ def register(subcommands, api):
     search.add_argument("--limit", type=int, default=12)
     search.add_argument("--out")
     search.set_defaults(func=lambda args: dispatch("review-search", args, api))
+    discover = actions.add_parser("discover", help="Bounded reference/citation chaining; metadata candidates only")
+    discover.add_argument("--jobs", nargs="+", required=True)
+    discover.add_argument("--direction", choices=["references", "citations", "both"], default="both")
+    discover.add_argument("--limit", type=int, default=12)
+    discover.add_argument("--out")
+    discover.set_defaults(func=lambda args: dispatch("discover", args, api))
+    table = actions.add_parser("matrix", help="Custom evidence comparison columns")
+    table_actions = table.add_subparsers(dest="matrix_action", required=True)
+    table_prepare = table_actions.add_parser("prepare")
+    table_prepare.add_argument("--jobs", nargs="+", required=True)
+    table_prepare.add_argument("--columns", nargs="+")
+    table_prepare.add_argument("--profile", default="")
+    table_prepare.add_argument("--out", required=True)
+    table_prepare.set_defaults(func=lambda args: dispatch("matrix-prepare", args, api))
+    table_render = table_actions.add_parser("render")
+    table_render.add_argument("--context", required=True)
+    table_render.add_argument("--input", required=True)
+    table_render.add_argument("--out", required=True, help="Output filename prefix for Markdown, CSV and evidence JSON")
+    table_render.set_defaults(func=lambda args: dispatch("matrix-render", args, api))
     bridge = subcommands.add_parser("bridge", help="Package the small companion for one-time installation in Zotero")
     bridge.add_argument("--out", required=True)
     bridge.set_defaults(func=lambda args: dispatch("bridge", args, api))
@@ -108,6 +145,7 @@ def run(action, args, api):
             for field in ("keywords", "priorities", "open_questions"):
                 if not isinstance(data.get(field, []), list) or not all(isinstance(v, str) and v.strip() for v in data.get(field, [])):
                     raise ValueError(f"{field} must be a list of nonempty strings")
+            quality.profile_fields(data)
             s.write(directory / (s.identifier(args.name) + ".json"), data)
         return s.profile(args.name)
     if action == "prepare":
@@ -117,7 +155,23 @@ def run(action, args, api):
     if action == "status":
         return jobs.inspect(args.job)
     if action == "accept":
-        return jobs.accept(args.job, s.read(args.input))
+        return jobs.accept(args.job, s.read(args.input), strict=args.strict)
+    if action == "revise":
+        return jobs.revise(args.job, s.read(args.input), args.expected_revision, args.reason)
+    if action == "history":
+        return jobs.history(args.job)
+    if action == "audit":
+        return {"issues": jobs.inspect(args.job)["translation_audit"], "note": "Deterministic checks identify review candidates, not scientific correctness"}
+    if action == "outline":
+        return jobs.outline(args.job)
+    if action == "annotations":
+        return native.collect(api, args.job)
+    if action == "annotate":
+        return native.publish(api, args.job, yes=args.yes)
+    if action == "ask":
+        return evidence.prepare_question(args.jobs, args.question, args.out, query=args.query, profile_name=args.profile, max_chars=args.max_chars)
+    if action == "answer":
+        return evidence.answer(s.read(args.context), s.read(args.input), args.out)
     if action == "export":
         return jobs.export(args.job, args.out, partial=args.partial)
     if action == "publish":
@@ -149,6 +203,15 @@ def run(action, args, api):
                 raise ValueError("Search output already exists")
             s.write(args.out, result)
         return result
+    if action == "discover":
+        result = discovery.discover(api, args.jobs, args.direction, args.limit)
+        if args.out:
+            evidence.write_new(args.out, result)
+        return result
+    if action == "matrix-prepare":
+        return matrix.prepare(args.jobs, args.profile, args.columns, args.out)
+    if action == "matrix-render":
+        return matrix.render(s.read(args.context), s.read(args.input), args.out)
     if action == "bridge":
         directory = Path(__file__).resolve().parents[2] / "bridge"
         target = Path(args.out).expanduser().resolve()

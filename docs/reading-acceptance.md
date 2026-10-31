@@ -19,11 +19,18 @@ This is a general-purpose open-source research tool. Research profiles belong to
 
 ## Verified in the development container
 
-- 61 Python tests: 44 existing, 17 new. New tests exercise evidence rejection, coverage, parse/model-result reuse across layout changes, changed-source detection, resume/conflicts, locks, selection failure behavior, HTML-safe/idempotent notes, reference/appendix scope, two-column reading, OCR contracts, PDF layouts/overflow/annotations, review provenance and recommendation labels.
+- 90 Python tests: 44 original, 17 initial workflow tests, and 29 lightweight enhancement tests. They exercise evidence rejection, coverage, parse/model-result reuse, correction history and stale-context rejection, scoped retrieval and FTS fallback, matrix evidence/CSV handling, native annotation geometry/idempotence/user edits, terminology/numeric review, HTTP header casing, plus the original PDF/cache/selection contracts.
 - 7 Node tests: existing skill provider plus component allowlisting, pinned runtime selection, checksum failure cleanup and companion endpoint lifecycle/authentication inheritance.
 - A new private runtime downloaded and prepared PDF packages, an embedded regular-weight Noto font, and OCR packages. A synthetic raster PDF was actually OCRed and its expected text checked. Unit tests remain offline; OCR is mocked there.
 - Three bilingual layouts and a highlighted PDF were generated; the side-by-side edition and highlight position were rendered and visually inspected. Chinese text, original figures and a table were readable. Fixtures are synthetic, not demonstrations of model translation quality.
 - npm package preview contains the runner, reader modules, companion sources, skill references and font license, without caches, PDFs, model files, virtual environments or test artifacts.
+- Bounded citation-discovery request shapes were checked against actual OpenAlex DOI resolution, batched references and citing-work queries. This is an API smoke test, not evidence of complete literature coverage.
+
+## Lightweight enhancement boundary
+
+The market comparison and inclusion decisions are recorded in [reader-market-choices.md](reader-market-choices.md). The second round adds no third-party dependencies or always-on processes. SQLite retrieval is lexical; absent FTS5 it falls back to a scoped standard-library scan. Source quotes, result revision and scope are validated before rendering a focused answer, matrix or synthesis. These checks do not prove scientific correctness.
+
+Zotero-native annotations use the documented item JSON fields and existing local-API authorization. Offline tests cover rotated-page coordinates, collisions, object-level write failures and preservation of edited comments. Actual Zotero creation and reader navigation still need the on-device integration checks below. Unusual cropped/nonzero-origin PDF geometry is explicitly rejected for native writes; annotated-copy export remains available.
 
 ## Required before marking the PR production-ready
 

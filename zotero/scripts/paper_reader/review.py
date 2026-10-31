@@ -1,6 +1,6 @@
 """Corpus synthesis uses accepted evidence, not metadata-based quality rankings."""
 from pathlib import Path
-from . import storage as s, jobs
+from . import storage as s, jobs, evidence as source_evidence
 
 
 def prepare(job_ids, profile_name, output):
@@ -13,6 +13,7 @@ def prepare(job_ids, profile_name, output):
         if not claims:
             warnings.append(f"{job_id}: no accepted reading evidence yet")
         papers.append({"job_id": job_id, "title": manifest["title"], "source_hash": manifest["source_hash"],
+                       "reading_revision": jobs.result_revision(directory),
                        "claims": claims, "missing": missing, "status": jobs.inspect(job_id),
                        "manifest": manifest})
     if not papers:
@@ -34,6 +35,7 @@ def render(corpus, analysis, output):
         raise ValueError("Prepared corpus was modified; prepare it again")
     if analysis.get("fingerprint") != corpus.get("fingerprint"):
         raise ValueError("Review does not match the prepared corpus")
+    source_evidence.check(corpus["papers"])
     known = {(p["job_id"], c["id"]): (p, c) for p in corpus["papers"] for c in p["claims"]}
     lines = ["# 文献比较与研究综述", "", "研究问题：" + (corpus["profile"].get("question") or "未指定"), "",
              "本报告的覆盖范围仅限列出的论文；候选空白不代表整个领域没有研究。", ""]

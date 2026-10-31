@@ -9,7 +9,7 @@ import time
 import urllib.parse
 
 from . import SCHEMA
-from . import pdf, storage as s
+from . import pdf, storage as s, quality
 
 CATEGORIES = {"overview": "研究问题与章节逻辑", "method": "方法与结构",
               "formula": "公式与推导", "experiment": "实验与消融",
@@ -127,6 +127,7 @@ def prepare_one(api, entry, settings, profile, args):
                         "source": str(source), "source_hash": source_hash, "document": str(cached),
                         "item_key": key, "attachment_key": attachment_key, "api_prefix": entry["api_prefix"],
                         "title": entry["item"].get("data", entry["item"]).get("title") or key,
+                        "doi": api.normalize_doi(entry["item"].get("data", entry["item"]).get("DOI")),
                         "settings": settings, "profile": profile, "profile_hash": s.digest(profile),
                         "result_store": str(s.root() / "reader-results" / analysis_key),
                         "prepare_seconds": round(time.monotonic() - started, 3)}
@@ -172,6 +173,13 @@ def result_store(directory):
 
 
 def aggregate(directory):
+    current = s.read(result_store(directory) / "current.json")
+    if current is not None:
+        payload = current["payload"]
+        content_hash = s.digest(payload)
+        if content_hash != current.get("content_hash") or s.digest({"content_hash": content_hash, "previous": current.get("previous")}) != current.get("revision"):
+            raise ValueError("Accepted result snapshot was modified; restore a verified revision")
+        return ({r["block_id"]: r["text"] for r in payload["translations"]}, payload["claims"], payload["missing"])
     translations, claims, missing = {}, {}, {}
     for path in sorted(result_store(directory).glob("*.json")):
         record = s.read(path)
@@ -186,6 +194,47 @@ def aggregate(directory):
             claims[row["id"]] = row
         missing.update(record.get("missing", {}))
     return translations, list(claims.values()), missing
+
+
+def result_revision(directory):
+    translations, claims, missing = aggregate(directory)
+    current = s.read(result_store(directory) / "current.json")
+    if current is not None:
+        return current["revision"]
+    return s.digest(result_payload(translations, claims, missing))
+
+
+def result_payload(translations, claims, missing):
+    return {"translations": [{"block_id": k, "text": v} for k, v in sorted(translations.items())],
+            "claims": sorted(claims, key=lambda c: c["id"]), "missing": missing}
+
+
+def commit_results(directory, payload, previous, reason):
+    content_hash = s.digest(payload)
+    old_t, old_c, old_m = aggregate(directory)
+    if content_hash == s.digest(result_payload(old_t, old_c, old_m)):
+        return
+    revision = s.digest({"content_hash": content_hash, "previous": previous})
+    store = result_store(directory)
+    snapshot = {"revision": revision, "content_hash": content_hash, "previous": previous, "reason": reason, "at": now(), "payload": payload}
+    # Retain each snapshot before atomically changing the current pointer.
+    s.write(store / "history" / (revision + ".json"), snapshot)
+    s.write(store / "current.json", snapshot)
+
+
+def history(job_id):
+    directory, _ = load(job_id)
+    store = result_store(directory)
+    revision = result_revision(directory)
+    result, visited = [], set()
+    while revision not in visited:
+        visited.add(revision)
+        record = s.read(store / "history" / (revision + ".json"))
+        if record is None:
+            break
+        result.append({k: record[k] for k in ("revision", "previous", "reason", "at")})
+        revision = record["previous"]
+    return result
 
 
 def validate(record, manifest, document):
@@ -234,20 +283,48 @@ def validate(record, manifest, document):
     return {"source_hash": record["source_hash"], "translations": translations, "claims": claims, "missing": missing}
 
 
-def accept(job_id, record):
+def accept(job_id, record, *, strict=False):
     directory, manifest = load(job_id)
     document = s.read(manifest["document"])
     result = validate(record, manifest, document)
     with s.lock(directory), s.lock(result_store(directory)):
-        previous_t, previous_c, _ = aggregate(directory)
+        previous_t, previous_c, previous_missing = aggregate(directory)
+        previous_revision = result_revision(directory)
         old_claims = {c["id"]: c for c in previous_c}
         for row in result["translations"]:
             if row["block_id"] in previous_t and previous_t[row["block_id"]] != row["text"]:
-                raise ValueError(f"Existing accepted translation differs for {row['block_id']}; create a new run/profile to revise")
+                raise ValueError(f"Existing accepted translation differs for {row['block_id']}; use read revise with the current revision")
         for row in result["claims"]:
             if row["id"] in old_claims and old_claims[row["id"]] != row:
                 raise ValueError("Accepted claim ids are immutable; use a new claim id for an additional finding")
-        s.write(result_store(directory) / (s.digest(result) + ".json"), result)
+        previous_t.update({r["block_id"]: r["text"] for r in result["translations"]})
+        old_claims.update({c["id"]: c for c in result["claims"]})
+        previous_missing.update(result["missing"])
+        for claim in old_claims.values():
+            previous_missing.pop(claim["category"], None)
+        if strict and quality.audit(document, previous_t, manifest["profile"]):
+            raise ValueError("Translation audit needs review; inspect numbers and glossary before strict acceptance")
+        commit_results(directory, result_payload(previous_t, list(old_claims.values()), previous_missing), previous_revision, "accept")
+    return inspect(job_id)
+
+
+def revise(job_id, record, expected_revision, reason):
+    if not isinstance(reason, str) or len(reason.strip()) < 8:
+        raise ValueError("Explain the correction in at least 8 characters")
+    directory, manifest = load(job_id)
+    document = s.read(manifest["document"])
+    result = validate(record, manifest, document)
+    with s.lock(directory), s.lock(result_store(directory)):
+        if result_revision(directory) != expected_revision:
+            raise ValueError("Reading revision changed; inspect it again before correcting")
+        translations, claims, missing = aggregate(directory)
+        by_id = {c["id"]: c for c in claims}
+        translations.update({r["block_id"]: r["text"] for r in result["translations"]})
+        by_id.update({c["id"]: c for c in result["claims"]})
+        missing.update(result["missing"])
+        for claim in by_id.values():
+            missing.pop(claim["category"], None)
+        commit_results(directory, result_payload(translations, list(by_id.values()), missing), expected_revision, reason)
     return inspect(job_id)
 
 
@@ -256,36 +333,45 @@ def inspect(job_id):
     document = s.read(manifest["document"])
     translations, claims, missing = aggregate(directory)
     outputs = set(manifest["settings"]["outputs"])
-    needs_translation = bool(outputs & {"translation", "bilingual-pdf"})
+    needs_translation = bool(outputs & {"translation", "bilingual-pdf", "bilingual-markdown"})
     untranslated = [b["id"] for b in document["blocks"] if b["translate"] and b["id"] not in translations] if needs_translation else []
     categories = set(CATEGORIES) if manifest["settings"]["mode"] == "deep" else {"overview", "method", "experiment", "contribution", "limitation"}
     absent = sorted(categories - {c["category"] for c in claims} - set(missing)) if outputs & {"notes", "zotero-note", "annotated-pdf"} else []
     unreadable = [p["number"] for p in document["pages"] if not p["readable"]]
-    return {"id": job_id, "translations": len(translations), "claims": len(claims),
+    return {"id": job_id, "revision": result_revision(directory), "translations": len(translations), "claims": len(claims),
             "untranslated_blocks": untranslated, "uncovered_categories": absent,
             "unreadable_pages": unreadable, "ready": not (untranslated or absent or unreadable),
-            "warnings": document["warnings"]}
+            "warnings": document["warnings"], "translation_audit": quality.audit(document, translations, manifest["profile"])}
 
 
-def source_link(manifest, page):
+def source_link(manifest, page, annotation_key=None):
     prefix = manifest["api_prefix"]
     library = "library" if prefix == "/api/users/0" else "groups/" + prefix.split("/")[-1]
-    return f"zotero://open-pdf/{library}/items/{manifest['attachment_key']}?page={page}"
+    url = f"zotero://open-pdf/{library}/items/{manifest['attachment_key']}?page={page}"
+    if annotation_key:
+        if not re.fullmatch(r"[A-Z0-9]{8}", annotation_key):
+            raise ValueError("Invalid Zotero annotation key")
+        url += "&annotation=" + annotation_key
+    return url
 
 
 def markdown(manifest, document, claims, missing):
     blocks = {b["id"]: b for b in document["blocks"]}
-    lines = ["# " + manifest["title"], "", f"- 阅读任务：`{manifest['id']}`",
-             f"- 原文指纹：`{manifest['source_hash']}`", f"- 研究问题：{manifest['profile'].get('question') or '通用阅读'}",
+    receipt = s.read(location(manifest["id"]) / "native-annotations.json", {})
+    published = set(receipt.get("created", []) + receipt.get("reused", [])) if receipt.get("source_hash") == manifest["source_hash"] else set()
+    lines = ["# " + manifest["title"], "", f"- 研究问题：{manifest['profile'].get('question') or '通用阅读'}",
              "", "原文报告、分析解释和待验证建议分别标记；引文定位校验不等于科学结论已获验证。", ""]
     for category, title in CATEGORIES.items():
         lines += ["## " + title, ""]
         found = [c for c in claims if c["category"] == category]
         for claim in found:
-            lines += [f"### {claim['id']} · {KIND_LABELS[claim['kind']]}", "", claim["statement"], ""]
+            lines += [f"**{KIND_LABELS[claim['kind']]}**", "", claim["statement"], ""]
             for ref in claim["evidence"]:
                 page = blocks[ref["block_id"]]["page"]
-                lines += [f"> {ref['quote']}", "", f"依据：[原文第 {page} 页]({source_link(manifest, page)}) · `{ref['block_id']}`", ""]
+                from .native import native_key
+                key = native_key([manifest["source_hash"], manifest["attachment_key"], claim["id"], ref])
+                link = source_link(manifest, page, key if key in published else None)
+                lines += [f"> {ref['quote']}", "", f"依据：[原文第 {page} 页]({link})", ""]
         if not found:
             lines += [missing.get(category, "本轮尚未分析此项。"), ""]
     if document["warnings"]:
@@ -332,6 +418,18 @@ def export(job_id, output_root, *, partial=False):
         path = target / ("translation.partial.md" if partial else "translation.md")
         path.write_text("\n".join(lines), encoding="utf-8")
         files.append(str(path))
+    if "bilingual-markdown" in outputs:
+        lines = ["# 逐段中英对照" + ("（阶段性成果）" if partial else ""), ""]
+        last_page = None
+        for block in document["blocks"]:
+            if block["page"] != last_page:
+                lines += [f"## [原文第 {block['page']} 页]({source_link(manifest, block['page'])})", ""]
+                last_page = block["page"]
+            lines += [f"<!-- {block['id']} -->", "> " + escape(block["text"], quote=False), ""]
+            lines += [escape(translations.get(block["id"], "**尚未翻译**" if block["translate"] else "[图表、公式或参考信息保留原文；请打开对应原页查看版式。]"), quote=False), ""]
+        path = target / ("bilingual.partial.md" if partial else "bilingual.md")
+        path.write_text("\n".join(lines), encoding="utf-8")
+        files.append(str(path))
     if not partial and outputs & {"annotated-pdf", "bilingual-pdf"}:
         pdf.dependencies()
         if "annotated-pdf" in outputs:
@@ -347,6 +445,38 @@ def export(job_id, output_root, *, partial=False):
     return {"files": files, "directory": str(target), "status": state}
 
 
+def outline(job_id):
+    directory, manifest = load(job_id)
+    if s.file_hash(manifest["source"]) != manifest["source_hash"]:
+        raise ValueError("Source changed; prepare a fresh job")
+    pdf.dependencies()
+    from pypdf import PdfReader
+    reader = PdfReader(manifest["source"])
+    entries, pending, visited = [], [(item, 1) for item in reversed(reader.outline)], set()
+    while pending and len(entries) < 300:
+        entry, level = pending.pop()
+        if id(entry) in visited:
+            continue
+        visited.add(id(entry))
+        if isinstance(entry, list):
+            if level < 12:
+                pending.extend((child, level + 1) for child in reversed(entry))
+            continue
+        try:
+            page = reader.get_destination_page_number(entry) + 1
+            entries.append({"title": str(entry.title), "level": level, "page": page,
+                            "url": source_link(manifest, page), "kind": "pdf_bookmark"})
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if not entries:
+        document = s.read(manifest["document"])
+        for block in document["blocks"]:
+            if len(block["text"]) < 100 and re.match(r"^(?:\d+(?:\.\d+)*[ .]+)?(?:abstract|introduction|background|related work|methods?|results?|experiments?|discussion|conclusions?|references|appendix)\b", block["text"], re.I):
+                entries.append({"title": block["text"], "level": 1, "page": block["page"],
+                                "url": source_link(manifest, block["page"]), "kind": "heuristic_heading"})
+    return {"outline": entries, "coverage": "PDF bookmarks when present, otherwise explicitly labelled heuristic headings"}
+
+
 def publish_note(api, job_id):
     directory, manifest = load(job_id)
     if not inspect(job_id)["ready"]:
@@ -359,15 +489,14 @@ def publish_note(api, job_id):
     # Escape model text. Only tool-created, validated Zotero links become HTML links.
     html = []
     for line in text.splitlines():
-        safe = escape(line)
-        safe = re.sub(r"\[([^\]]+)\]\((zotero://open-pdf/[A-Za-z0-9_/?=&-]+)\)", r'<a href="\2">\1</a>', safe)
+        safe = zotero_link_html(line)
         if line.startswith("#"):
             level = min(3, len(line) - len(line.lstrip("#")))
             safe = f"<h{level}>" + safe.lstrip("# ") + f"</h{level}>"
         else:
             safe = "<p>" + safe + "</p>"
         html.append(safe)
-    receipt = directory / "published" / (s.digest({"claims": claims, "missing": missing}) + ".json")
+    receipt = directory / "published" / (s.digest({"claims": claims, "missing": missing, "note": text}) + ".json")
     with s.lock(directory):
         previous = s.read(receipt)
         if previous:
@@ -380,3 +509,13 @@ def publish_note(api, job_id):
         result = {"note_key": key, "parent_item": manifest["item_key"], "source_hash": manifest["source_hash"]}
         s.write(receipt, result)
         return result
+
+
+def zotero_link_html(line):
+    pattern = r"\[([^\]]+)\]\((zotero://open-pdf/(?:library|groups/\d+)/items/[A-Z0-9]{8}\?page=\d+(?:&annotation=[A-Z0-9]{8})?)\)"
+    parts, offset = [], 0
+    for match in re.finditer(pattern, line):
+        parts += [escape(line[offset:match.start()]), '<a href="' + escape(match[2], quote=True) + '">' + escape(match[1]) + '</a>']
+        offset = match.end()
+    parts.append(escape(line[offset:]))
+    return "".join(parts)
