@@ -33,6 +33,7 @@ description: 面向不同研究领域的 Zotero 技能：原文定位问答、�
 用户只问具体段落、公式、已有批注或要求证据对比表时，按需读 [references/focused-reading.md](references/focused-reading.md)，只检索所需片段、复用已读成果，展示本次任务必要的选项。不要为一个局部问题默认重新生成全文译文、询问全部导出选项。
 使用宿主当前模型生成，一份分析与译文复用于 Markdown、Zotero 笔记和 PDF；默认省用量，用户可选继承当前模型配置的受限并行。
 通过 `read prepare/accept/status/export/publish` 建立可恢复、可定位到原文的阅读任务；多篇综述用 `review prepare/render/search`，材料不足时明确不足并自动搜索带理由的补充候选。
+`read status` 只列前 20 个未翻译块与前 40 条复核提示（并给 `untranslated_total` / `translation_audit_total`），完整复核列表用 `read audit`；长论文可把分块任务交给子任务写 `<job>/results/t-*.json`，`read status` 会实时计入，最后一次 `read accept` 汇总。
 运行入口为技能资源目录内 `scripts/reader-runner.mjs`（Node 20+），包安装也提供 `lib/reader-runner.js`；首次按需准备本地 Python/PDF/OCR 组件，现有 Python CLI 也保留。
 当前选中论文需安装包内配套 Zotero 扩展；分类、标签、检索和明确 item key 继续使用已有 API。
 不把元数据模板当成精读结论，不把局部语料统计当成已证明的研究空白，不承诺未经实测的完成时间。
