@@ -158,6 +158,18 @@ class ReaderTests(unittest.TestCase):
             jobs.accept(job_id, conflict)
         self.assertTrue(jobs.inspect(job_id)['ready'])
 
+    def test_status_truncates_the_audit_but_read_audit_keeps_everything(self):
+        job_id = self.prepare()['id']
+        jobs.accept(job_id, self.full_result(job_id))
+        issues = [{'block_id': 'p1-b1', 'code': 'number_mismatch', 'severity': 'review'} for _ in range(jobs.AUDIT_INLINE_LIMIT + 5)]
+        with patch.object(jobs.quality, 'audit', return_value=issues):
+            status = jobs.inspect(job_id)
+            full = jobs.audit(job_id)
+        self.assertEqual(len(status['translation_audit']), jobs.AUDIT_INLINE_LIMIT)
+        self.assertEqual(status['translation_audit_total'], len(issues))
+        self.assertIn('read audit', status['translation_audit_note'])
+        self.assertEqual(len(full), len(issues))
+
     def test_deep_notes_need_coverage_or_explicit_missing_evidence(self):
         job_id = self.prepare()['id']
         result = self.full_result(job_id)

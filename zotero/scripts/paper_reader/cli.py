@@ -161,7 +161,8 @@ def run(action, args, api):
     if action == "history":
         return jobs.history(args.job)
     if action == "audit":
-        return {"issues": jobs.inspect(args.job)["translation_audit"], "note": "Deterministic checks identify review candidates, not scientific correctness"}
+        issues = jobs.audit(args.job)
+        return {"issues": issues, "total": len(issues), "note": "Deterministic checks identify review candidates, not scientific correctness"}
     if action == "outline":
         return jobs.outline(args.job)
     if action == "annotations":
