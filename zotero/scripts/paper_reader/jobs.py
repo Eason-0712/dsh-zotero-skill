@@ -176,34 +176,73 @@ def result_store(directory):
 
 
 def aggregate(directory):
-    current = s.read(result_store(directory) / "current.json")
+    """Merge the accepted snapshot with the chunk results written since it.
+
+    The snapshot stays authoritative: it is what someone explicitly accepted, so
+    a later chunk row never silently replaces an accepted translation or claim.
+    Chunk rows only fill in what the snapshot does not cover yet, which is the
+    normal flow after `read accept` was called with partial results — ignoring
+    them made `read accept` report `translations: 0` for work that had already
+    been written to disk.
+    """
+    store = result_store(directory)
+    current = s.read(store / "current.json")
+    translations, claims, missing = {}, {}, {}
+    accepted_blocks, accepted_claims = set(), set()
     if current is not None:
         payload = current["payload"]
         content_hash = s.digest(payload)
         if content_hash != current.get("content_hash") or s.digest({"content_hash": content_hash, "previous": current.get("previous")}) != current.get("revision"):
             raise ValueError("Accepted result snapshot was modified; restore a verified revision")
-        return ({r["block_id"]: r["text"] for r in payload["translations"]}, payload["claims"], payload["missing"])
-    translations, claims, missing = {}, {}, {}
-    for path in sorted(result_store(directory).glob("*.json")):
+        translations = {r["block_id"]: r["text"] for r in payload["translations"]}
+        claims = {c["id"]: c for c in payload["claims"]}
+        missing = dict(payload["missing"])
+        accepted_blocks.update(translations)
+        accepted_claims.update(claims)
+    for path in sorted(store.glob("*.json")):
+        if path.name == "current.json":
+            continue
         record = s.read(path)
+        if not isinstance(record, dict):
+            continue
         for row in record.get("translations", []):
-            old = translations.get(row["block_id"])
-            if old is not None and old != row["text"]:
-                raise ValueError(f"Conflicting translations for {row['block_id']}")
-            translations[row["block_id"]] = row["text"]
+            block_id = row["block_id"]
+            if block_id in translations:
+                if block_id not in accepted_blocks and translations[block_id] != row["text"]:
+                    raise ValueError(f"Conflicting translations for {block_id}")
+                continue
+            translations[block_id] = row["text"]
         for row in record.get("claims", []):
-            if row["id"] in claims and claims[row["id"]] != row:
-                raise ValueError(f"Conflicting claim id: {row['id']}")
-            claims[row["id"]] = row
-        missing.update(record.get("missing", {}))
+            key = row["id"]
+            if key in claims:
+                if key not in accepted_claims and claims[key] != row:
+                    raise ValueError(f"Conflicting claim id: {key}")
+                continue
+            claims[key] = row
+        for category, reason in record.get("missing", {}).items():
+            missing.setdefault(category, reason)
     return translations, list(claims.values()), missing
 
 
 def result_revision(directory):
     translations, claims, missing = aggregate(directory)
     current = s.read(result_store(directory) / "current.json")
+    payload = result_payload(translations, claims, missing)
+    if current is not None and s.digest(payload) == current.get("content_hash"):
+        return current["revision"]
+    return s.digest(payload)
+
+
+def base_revision(directory):
+    """The revision a new snapshot should build on.
+
+    Pending chunk results are not a revision yet, so the chain keeps pointing at
+    the last accepted snapshot instead of at a hash that was never committed.
+    """
+    current = s.read(result_store(directory) / "current.json")
     if current is not None:
         return current["revision"]
+    translations, claims, missing = aggregate(directory)
     return s.digest(result_payload(translations, claims, missing))
 
 
@@ -292,7 +331,7 @@ def accept(job_id, record, *, strict=False):
     result = validate(record, manifest, document)
     with s.lock(directory), s.lock(result_store(directory)):
         previous_t, previous_c, previous_missing = aggregate(directory)
-        previous_revision = result_revision(directory)
+        previous_revision = base_revision(directory)
         old_claims = {c["id"]: c for c in previous_c}
         for row in result["translations"]:
             if row["block_id"] in previous_t and previous_t[row["block_id"]] != row["text"]:
@@ -327,7 +366,7 @@ def revise(job_id, record, expected_revision, reason):
         missing.update(result["missing"])
         for claim in by_id.values():
             missing.pop(claim["category"], None)
-        commit_results(directory, result_payload(translations, list(by_id.values()), missing), expected_revision, reason)
+        commit_results(directory, result_payload(translations, list(by_id.values()), missing), base_revision(directory), reason)
     return inspect(job_id)
 
 

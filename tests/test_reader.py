@@ -113,6 +113,35 @@ class ReaderTests(unittest.TestCase):
             jobs.accept(job_id, bad)
         self.assertEqual(jobs.inspect(job_id)['claims'], 0)
 
+    def test_chunk_results_written_after_an_accept_still_count(self):
+        job_id = self.prepare()['id']
+        directory, manifest = jobs.load(job_id)
+        document = s.read(manifest['document'])
+        blocks = [b for b in document['blocks'] if b['translate']]
+        self.assertGreater(len(blocks), 1)
+        first = dict(self.full_result(job_id), translations=[{'block_id': blocks[0]['id'], 'text': '已经接受的第一段译文，用来模拟部分提交。'}], claims=[])
+        jobs.accept(job_id, first)
+        self.assertEqual(jobs.inspect(job_id)['translations'], 1)
+        store = jobs.result_store(directory)
+        pending = [{'block_id': block['id'], 'text': f'分块写入的第 {index} 段中文译文，包含方法与实验信息。'}
+                   for index, block in enumerate(blocks[1:], 2)]
+        s.write(store / 't-0001.json', {'source_hash': manifest['source_hash'], 'translations': pending, 'claims': [], 'missing': {}})
+        status = jobs.inspect(job_id)
+        self.assertEqual(status['translations'], len(blocks))
+        self.assertEqual(status['untranslated_blocks'], [])
+        # The accepted snapshot still wins over a later, conflicting chunk row.
+        s.write(store / 't-0002.json', {'source_hash': manifest['source_hash'],
+                                        'translations': [{'block_id': blocks[0]['id'], 'text': '试图覆盖已接受译文的另一段文字。'}],
+                                        'claims': [], 'missing': {}})
+        self.assertEqual(jobs.inspect(job_id)['translations'], len(blocks))
+        # Two pending chunks that disagree with each other are still an error.
+        other = next(b for b in blocks[1:])
+        s.write(store / 't-0003.json', {'source_hash': manifest['source_hash'],
+                                        'translations': [{'block_id': other['id'], 'text': '与另一个分块互相矛盾的译文内容。'}],
+                                        'claims': [], 'missing': {}})
+        with self.assertRaisesRegex(ValueError, 'Conflicting translations'):
+            jobs.aggregate(directory)
+
     def test_partial_results_resume_and_conflicts_are_not_overwritten(self):
         job_id = self.prepare()['id']
         result = self.full_result(job_id)

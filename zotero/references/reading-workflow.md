@@ -31,6 +31,8 @@
 
 将结果写入一个 UTF-8 JSON 文件，然后执行 `read accept <job> --input result.json`。可分批接受并恢复；普通接受不可覆盖旧结果，新增解释用新的 claim id。需要更正已有译文或结论时使用带 expected-revision 和原因的 `read revise`，并保留历史，详见 focused-reading.md。
 
+`read status <job>` 与 `read accept` 统计的是「已接受快照 + 之后写入的分块结果」：子任务写出的 `t-*.json` 即使还没单独提交，也会被算进译文与结论数量，不会被上一次快照盖住，因此可以分批交付、边写边看。已接受的内容始终优先，后写入的分块不会覆盖它；两个尚未接受的分块互相矛盾时仍会报 `Conflicting translations`，需要先改掉其中一个再接受。
+
 ```json
 {
   "source_hash": "prepare返回的精确SHA256",
