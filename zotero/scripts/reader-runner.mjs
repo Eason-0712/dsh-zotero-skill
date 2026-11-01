@@ -1,6 +1,6 @@
 /** Managed local components; no model keys, endpoints or inference calls. */
 import { createHash } from 'node:crypto';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -257,6 +257,12 @@ export async function main(args = process.argv.slice(2)) {
   throw new Error('Component preparation did not resolve the dependency; inspect the progress log');
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function sameFile(left, right) {
+  // A linked install (and any symlinked checkout) makes argv[1] differ from the
+  // resolved module URL, so compare real paths instead of raw strings.
+  try { return realpathSync(resolve(left)) === realpathSync(resolve(right)); } catch { return false; }
+}
+
+if (process.argv[1] && sameFile(process.argv[1], fileURLToPath(import.meta.url))) {
   main().then(code => { process.exitCode = code; }).catch(error => { console.error(`Reader setup: ${error.message}`); process.exitCode = 1; });
 }
