@@ -25,13 +25,30 @@
 
 **同模型并行（用户选择）**：先检查宿主实际可用的内部子任务能力。仅使用继承当前模型配置的本地子任务，不指定不同模型或外部后端；最大并发由 max_workers 控制，不嵌套创建子任务。每个任务读取独立块、生成独立 JSON，交给主任务顺序 accept。由主任务统一术语、消除重复、检查矛盾，再导出。若宿主缺少此能力，说明后按省用量模式继续，不声称已经并行。并行可能增加重复上下文和用量，不能承诺固定加速倍数。
 
-按 priority 先交付有依据的速读卡、首批笔记或译文。第一份内容必须来自实际原文，可以明确是阶段性成果。其后继续完成全部用户选择的输出。`read status <job>` 返回未翻译块与未覆盖分析项；恢复任务时只处理缺少内容。
+按 priority 先交付有依据的速读卡、首批笔记或译文。第一份内容必须来自实际原文，可以明确是阶段性成果。其后继续完成全部用户选择的输出。`read status <job>` 返回未翻译块与未覆盖分析项：未翻译块默认只列前 20 个并给 `untranslated_total`，复核提示默认只列前 40 条并给 `translation_audit_total`，完整复核列表用 `read audit`。恢复任务时只处理缺少内容。
+
+## 运行环境与网络
+
+首次运行会在 `~/.zotero-skill/reader-runtime/` 准备私有 Python 与 PDF/OCR 组件。以下环境变量用于适配内网、镜像和已有环境，都是可选的：
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `ZOTERO_SKILL_CONFIG_DIR` | 状态目录（任务、证据、授权凭据） | `~/.zotero-skill` |
+| `DSH_READER_PYPI_INDEX` | pip 索引，逗号或空格分隔，按顺序尝试 | `https://pypi.org/simple` 然后 `https://mirrors.aliyun.com/pypi/simple` |
+| `DSH_READER_PYTHON` | 指定系统解释器（需 3.10+）；uv 下载失败时用它建私有环境 | 自动探测 `py -3` / `python` / `python3` |
+| `DSH_READER_FONT` | 指定 CJK 字体文件，避免下载 Noto Sans SC | 下载并按需嵌入；失败时回退系统字体（微软雅黑/黑体/宋体等） |
+| `ZOTERO_LOCAL_BASE_URL` | Zotero 本地 API 地址 | `http://127.0.0.1:23119` |
+| `ZOTERO_LOCAL_API_KEY` | 写操作凭据；不设则读 `~/.zotero-skill/local-key.json` | 由 `authorize` 生成 |
+
+镜像或代理受限时先设 `DSH_READER_PYPI_INDEX` 与 `DSH_READER_PYTHON`；字体下载失败不影响文字输出，只影响嵌入字形。
 
 ## 模型结果 JSON 与引用
 
 将结果写入一个 UTF-8 JSON 文件，然后执行 `read accept <job> --input result.json`。可分批接受并恢复；普通接受不可覆盖旧结果，新增解释用新的 claim id。需要更正已有译文或结论时使用带 expected-revision 和原因的 `read revise`，并保留历史，详见 focused-reading.md。
 
 `read status <job>` 与 `read accept` 统计的是「已接受快照 + 之后写入的分块结果」：子任务写出的 `t-*.json` 即使还没单独提交，也会被算进译文与结论数量，不会被上一次快照盖住，因此可以分批交付、边写边看。已接受的内容始终优先，后写入的分块不会覆盖它；两个尚未接受的分块互相矛盾时仍会报 `Conflicting translations`，需要先改掉其中一个再接受。
+
+长论文的并行做法：主任务读 `<job>/tasks/chunk-*.json`，把每个分块交给一个子任务；子任务只写自己那份，格式同上（可以只有 `translations`），保存成 `<job>/results/t-<任意序号>.json`，文件名互不相同即可。写完后 `read status` 立刻能看到进度，最后一次 `read accept --input` 汇总成快照。这样不必等所有译文回齐才提交，也不会因为中途 accept 而丢掉后续分块。
 
 ```json
 {

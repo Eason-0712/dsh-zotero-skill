@@ -18,6 +18,7 @@ CATEGORIES = {"overview": "研究问题与章节逻辑", "method": "方法与结
 KINDS = {"reported", "interpretation", "proposal"}
 KIND_LABELS = {"reported": "原文报告", "interpretation": "分析解释", "proposal": "待验证建议"}
 AUDIT_INLINE_LIMIT = 40
+UNTRANSLATED_INLINE_LIMIT = 20
 
 
 def now():
@@ -386,7 +387,9 @@ def inspect(job_id):
     unreadable = [p["number"] for p in document["pages"] if not p["readable"]]
     issues = quality.audit(document, translations, manifest["profile"])
     return {"id": job_id, "revision": result_revision(directory), "translations": len(translations), "claims": len(claims),
-            "untranslated_blocks": untranslated, "uncovered_categories": absent,
+            "untranslated_blocks": untranslated[:UNTRANSLATED_INLINE_LIMIT],
+            "untranslated_total": len(untranslated),
+            "uncovered_categories": absent,
             "unreadable_pages": unreadable, "ready": not (untranslated or absent or unreadable),
             "warnings": document["warnings"], "translation_audit": issues[:AUDIT_INLINE_LIMIT],
             "translation_audit_total": len(issues),

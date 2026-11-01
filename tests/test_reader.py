@@ -142,6 +142,16 @@ class ReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Conflicting translations'):
             jobs.aggregate(directory)
 
+    def test_status_truncates_the_untranslated_block_list(self):
+        job_id = self.prepare()['id']
+        status = jobs.inspect(job_id)
+        self.assertGreater(status['untranslated_total'], 1)
+        self.assertEqual(status['untranslated_total'], len(status['untranslated_blocks']))
+        with patch.object(jobs, 'UNTRANSLATED_INLINE_LIMIT', 1):
+            truncated = jobs.inspect(job_id)
+        self.assertEqual(len(truncated['untranslated_blocks']), 1)
+        self.assertEqual(truncated['untranslated_total'], status['untranslated_total'])
+
     def test_history_still_walks_accepted_snapshots_with_pending_chunks(self):
         job_id = self.prepare()['id']
         directory, manifest = jobs.load(job_id)
