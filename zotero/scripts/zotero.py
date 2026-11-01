@@ -50,7 +50,7 @@ class Response:
 
     @property
     def content_type(self) -> str:
-        return self.headers.get("Content-Type", "")
+        return next((value for key, value in self.headers.items() if key.lower() == "content-type"), "")
 
 
 def dump_json(value: Any) -> None:
@@ -387,7 +387,7 @@ def count_bibtex_entries(text: str) -> int:
 
 
 def total_results(response: Response) -> int | None:
-    raw = response.headers.get("Total-Results")
+    raw = next((value for key, value in response.headers.items() if key.lower() == "total-results"), None)
     return int(raw) if raw and raw.isdigit() else None
 
 
@@ -785,6 +785,12 @@ DEFAULT_DAILY_CONFIG: dict[str, Any] = {
     "schedule_time": "08:00",
 }
 MAX_DAILY_ITEMS = 30
+CROSSREF_WEIGHTS: dict[str, float] = {
+    "venue": 0.0,
+    "citations": 0.55,
+    "relevance": 0.0,
+    "recency": 0.45,
+}
 DAILY_TASK_NAME = "DSH-Zotero-Daily"
 OPENALEX_BASE = "https://api.openalex.org"
 
@@ -940,6 +946,101 @@ def fetch_openalex_works(
     return results
 
 
+CROSSREF_BASE = "https://api.crossref.org"
+
+
+def crossref_get(
+    path: str,
+    params: dict[str, Any],
+    *,
+    optional: bool = False,
+    attempts: int = 3,
+) -> dict[str, Any]:
+    payload = {key: value for key, value in params.items() if value is not None}
+    url = CROSSREF_BASE + path + "?" + urllib.parse.urlencode(payload)
+    request_headers = {
+        "User-Agent": "dsh-zotero-skill/0.5 (+https://github.com/Eason-0712/dsh-zotero-skill)"
+    }
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, headers=request_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+    if optional:
+        print(f"Crossref request failed ({path}): {last_error}", file=sys.stderr)
+        return {}
+    exit_with(f"Crossref request failed ({path}): {last_error}")
+
+
+def crossref_item_to_work(item: dict[str, Any]) -> dict[str, Any]:
+    """Map a Crossref work to the OpenAlex-shaped dict score_candidate reads."""
+    doi = normalize_doi(item.get("DOI"))
+    titles = item.get("title") or []
+    containers = item.get("container-title") or []
+    parts = (item.get("issued") or {}).get("date-parts") or []
+    first = parts[0] if parts else []
+    year = int(first[0]) if first and first[0] else 0
+    month = int(first[1]) if len(first) > 1 and first[1] else 1
+    day = int(first[2]) if len(first) > 2 and first[2] else 1
+    published = f"{year:04d}-{month:02d}-{day:02d}" if year else ""
+    authors = []
+    for entry in item.get("author") or []:
+        family = str(entry.get("family") or "").strip()
+        given = str(entry.get("given") or "").strip()
+        name = f"{family}, {given}" if family and given else (family or str(entry.get("name") or "").strip())
+        if name:
+            authors.append(name)
+    abstract = re.sub(r"<[^>]+>", " ", str(item.get("abstract") or ""))
+    return {
+        "_source": "crossref",
+        "id": f"https://doi.org/{doi}" if doi else "",
+        "doi": doi,
+        "title": str(titles[0]).strip() if titles else "",
+        "publication_date": published,
+        "cited_by_count": int(item.get("is-referenced-by-count") or 0),
+        "primary_location": {
+            "source": {"id": "", "display_name": str(containers[0]).strip() if containers else ""}
+        },
+        "authorships": [{"author": {"display_name": name}} for name in authors],
+        "open_access": {"is_oa": False},
+        "type": "preprint" if item.get("type") == "posted-content" else "article",
+        "relevance_score": None,
+        "abstract_inverted_index": None,
+        "abstract": " ".join(abstract.split()),
+    }
+
+
+def fetch_crossref_works(
+    topic: str,
+    start_date: str,
+    end_date: str,
+    *,
+    rows: int = 100,
+    mailto: str = "",
+) -> list[dict[str, Any]]:
+    """Crossref has no relevance score; ranking falls back to citations and recency."""
+    payload = crossref_get(
+        "/works",
+        {
+            "query.bibliographic": topic,
+            "filter": f"from-pub-date:{start_date},until-pub-date:{end_date},type:journal-article",
+            "rows": clamp_int(rows, 1, 200, 100),
+            "select": "DOI,title,container-title,author,issued,is-referenced-by-count,abstract,type",
+            "mailto": mailto or None,
+        },
+        optional=True,
+    )
+    message = payload.get("message") if isinstance(payload, dict) else {}
+    items = message.get("items") or []
+    return [crossref_item_to_work(item) for item in items if item.get("DOI")]
+
+
+
 def fetch_source_metrics(source_ids: list[str], mailto: str = "") -> dict[str, dict[str, Any]]:
     metrics: dict[str, dict[str, Any]] = {}
     ids = [
@@ -1051,7 +1152,8 @@ def score_candidate(
         "venue_score": round(venue_raw, 2),
         "citations": citations,
         "authors": authors,
-        "abstract": rebuild_abstract(work.get("abstract_inverted_index")),
+        "abstract": rebuild_abstract(work.get("abstract_inverted_index"))
+        or str(work.get("abstract") or ""),
         "score": round(score, 4),
         "metrics": {
             "venue": round(venue_norm, 3),
@@ -1091,7 +1193,11 @@ def bibtex_key_for(candidate: dict[str, Any], index: int = 0) -> str:
     year = str(candidate.get("published") or "")[:4] or "n"
     words = [word for word in normalize_text(candidate.get("title")).split() if len(word) > 2]
     word = re.sub(r"[^a-z0-9]", "", words[0]) if words else "paper"
-    suffix = "" if index == 0 else chr(ord("a") + index)
+    if not re.fullmatch(r"[a-z0-9]+", surname) or (surname == "anon" and authors):
+        surname = "cn"
+    if not re.fullmatch(r"[a-z0-9]+", word or ""):
+        word = "paper"
+    suffix = "" if index == 0 else chr(ord("a") + min(index, 25))
     return f"{surname}{year}{word or 'paper'}{suffix}"
 
 
@@ -1107,8 +1213,13 @@ def build_bibtex_entry(candidate: dict[str, Any], index: int = 0) -> str:
         ("author", " and ".join(candidate.get("authors") or [])),
         ("journal", candidate.get("venue") or ""),
         ("year", str(candidate.get("published") or "")[:4]),
+        ("volume", candidate.get("volume") or ""),
+        ("number", candidate.get("number") or ""),
+        ("pages", candidate.get("pages") or ""),
         ("doi", doi),
         ("url", f"https://doi.org/{doi}" if doi else ""),
+        ("keywords", candidate.get("keywords") or ""),
+        ("language", candidate.get("language") or ""),
         ("abstract", candidate.get("abstract") or ""),
     ]
     body = ",\n".join(
@@ -1857,19 +1968,31 @@ def gather_candidates(
     include_preprints: bool = False,
     mailto: str = "",
     pages: int = 1,
+    sources: tuple[str, ...] = ("openalex",),
 ) -> list[dict[str, Any]]:
     works: list[dict[str, Any]] = []
     for topic in queries:
-        works.extend(
-            fetch_openalex_works(
-                topic,
-                start_date,
-                end_date,
-                include_preprints=include_preprints,
-                mailto=mailto,
-                pages=pages,
+        if "openalex" in sources:
+            works.extend(
+                fetch_openalex_works(
+                    topic,
+                    start_date,
+                    end_date,
+                    include_preprints=include_preprints,
+                    mailto=mailto,
+                    pages=pages,
+                )
             )
-        )
+        if "crossref" in sources:
+            works.extend(
+                fetch_crossref_works(
+                    topic,
+                    start_date,
+                    end_date,
+                    rows=100,
+                    mailto=mailto,
+                )
+            )
     if not works:
         return []
 
@@ -1879,7 +2002,8 @@ def gather_candidates(
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     for work in works:
-        candidate = score_candidate(work, venue_stats, weights, today)
+        work_weights = CROSSREF_WEIGHTS if work.get("_source") == "crossref" else weights
+        candidate = score_candidate(work, venue_stats, work_weights, today)
         key = normalize_doi(work.get("doi")) or str(work.get("id") or "")
         if key in seen:
             continue
@@ -1926,6 +2050,298 @@ def import_candidates(
     return {"imported": len(candidates), "session": session, "response": parse_body(response)}
 
 
+# --- Chinese literature: CNKI deep links and official export files -----------
+# CNKI has no public search API. The skill therefore never scrapes it: it builds
+# search links for the user and imports the export file CNKI produces itself.
+
+CNKI_SEARCH_URL = "https://kns.cnki.net/kns8s/defaultresult/index"
+CNKI_ADVANCED_URL = "https://kns.cnki.net/kns8s/AdvSearch"
+CNKI_FIELD_CODES = {
+    "主题": "SU",
+    "篇名": "TI",
+    "关键词": "KY",
+    "摘要": "AB",
+    "作者": "AU",
+    "全文": "FT",
+    "作者单位": "AF",
+}
+CNKI_EXPORT_HINT = (
+    "知网不提供公开检索 API。请在知网页面检索后勾选文献，"
+    "用「导出与分析 → 导出文献」选择 RefWorks / EndNote / NoteExpress 格式，"
+    "把导出的 .txt 交给 cnki-import。"
+)
+
+
+def cnki_search_url(
+    query: str,
+    *,
+    field: str = "主题",
+    journals_only: bool = True,
+) -> str:
+    params: dict[str, Any] = {"kw": query}
+    code = CNKI_FIELD_CODES.get(field)
+    if code and code != "SU":
+        params["korder"] = code
+    if journals_only:
+        params["dbcode"] = "CJFQ"
+    return CNKI_SEARCH_URL + "?" + urllib.parse.urlencode(params)
+
+
+def open_in_browser(url: str) -> bool:
+    if sys.platform == "win32":
+        subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", url])
+    else:
+        subprocess.Popen(["xdg-open", url])
+    return True
+
+
+def detect_cnki_format(text: str) -> str:
+    head = "\n".join(text.replace("\ufeff", "").splitlines()[:60])
+    if re.search(r"(?m)^%[0-9A-Za-z@]", head):
+        return "endnote"
+    if re.search(r"(?m)^RT\s", head):
+        return "refworks"
+    return ""
+
+
+def _cnki_lines(text: str) -> list[str]:
+    return [line.rstrip("\r") for line in text.replace("\ufeff", "").splitlines()]
+
+
+def parse_refworks(text: str) -> list[dict[str, Any]]:
+    """Parse the CNKI RefWorks-tagged export; unknown tags are kept as-is."""
+    records: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    last = ""
+    for line in _cnki_lines(text):
+        if not line.strip():
+            continue
+        match = re.match(r"^([A-Z][A-Z0-9])\s(.*)$", line)
+        if not match:
+            if current is not None and last:
+                current[last] = (current[last] + " " + line.strip()).strip()
+            continue
+        tag, value = match.group(1), match.group(2).strip()
+        if tag == "RT":
+            current = {"RT": value}
+            records.append(current)  # type: ignore[arg-type]
+            last = "RT"
+            continue
+        if current is None:
+            current = {}
+            records.append(current)  # type: ignore[arg-type]
+        current[tag] = f"{current[tag]} {value}".strip() if tag in current else value
+        last = tag
+    return [refworks_to_record(record) for record in records if record.get("T1") or record.get("T0")]
+
+
+def refworks_to_record(fields: dict[str, str]) -> dict[str, Any]:
+    title = fields.get("T1") or fields.get("T0") or ""
+    journal = fields.get("JF") or fields.get("JO") or fields.get("T2") or ""
+    authors = [part.strip() for part in re.split(r"[;；]", fields.get("A1") or "") if part.strip()]
+    year = (fields.get("YR") or fields.get("FD") or "").strip()[:4]
+    pages = ""
+    if fields.get("SP"):
+        pages = fields["SP"] + (f"-{fields['EP']}" if fields.get("EP") else "")
+    return {
+        "title": title.strip(),
+        "journal": journal.strip(),
+        "authors": authors,
+        "year": year,
+        "volume": (fields.get("VO") or "").strip(),
+        "issue": (fields.get("IS") or "").strip(),
+        "pages": pages,
+        "doi": (fields.get("DO") or "").strip(),
+        "abstract": (fields.get("AB") or "").strip(),
+        "keywords": (fields.get("K1") or "").strip(),
+        "type": (fields.get("RT") or "").strip(),
+    }
+
+
+def parse_endnote(text: str) -> list[dict[str, Any]]:
+    """Parse EndNote / NoteExpress tagged exports (%0 %A %T %J %D ...)."""
+    raw: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in _cnki_lines(text):
+        if not line.strip():
+            continue
+        match = re.match(r"^%([0-9A-Za-z@])\s?(.*)$", line)
+        if not match:
+            continue
+        tag, value = match.group(1), match.group(2).strip()
+        if tag == "0":
+            current = {"type": value, "authors": []}
+            raw.append(current)
+            continue
+        if current is None:
+            current = {"authors": []}
+            raw.append(current)
+        if tag == "A":
+            if value:
+                current["authors"].append(value)
+        else:
+            current[tag] = value
+    records = []
+    for entry in raw:
+        pages = str(entry.get("P") or "").strip()
+        records.append(
+            {
+                "title": str(entry.get("T") or "").strip(),
+                "journal": str(entry.get("J") or "").strip(),
+                "authors": entry.get("authors") or [],
+                "year": str(entry.get("D") or "").strip()[:4],
+                "volume": str(entry.get("V") or "").strip(),
+                "issue": str(entry.get("N") or "").strip(),
+                "pages": pages,
+                "doi": str(entry.get("R") or "").strip(),
+                "abstract": str(entry.get("X") or "").strip(),
+                "keywords": str(entry.get("K") or entry.get("K1") or "").strip(),
+                "type": str(entry.get("type") or "").strip(),
+            }
+        )
+    return [record for record in records if record["title"]]
+
+
+def cnki_records(text: str) -> tuple[str, list[dict[str, Any]]]:
+    fmt = detect_cnki_format(text)
+    if fmt == "endnote":
+        return fmt, parse_endnote(text)
+    if fmt == "refworks":
+        return fmt, parse_refworks(text)
+    exit_with(
+        "无法识别的知网导出格式。请在知网选择 RefWorks、EndNote 或 NoteExpress 格式重新导出。"
+    )
+
+
+def cnki_candidate(record: dict[str, Any], index: int = 0) -> dict[str, Any]:
+    year = str(record.get("year") or "").strip()
+    published = f"{year}-01-01" if re.fullmatch(r"\d{4}", year) else ""
+    return {
+        "title": str(record.get("title") or "").strip(),
+        "authors": record.get("authors") or [],
+        "venue": str(record.get("journal") or "").strip(),
+        "published": published,
+        "doi": normalize_doi(record.get("doi")),
+        "abstract": str(record.get("abstract") or "").strip(),
+        "volume": str(record.get("volume") or "").strip(),
+        "number": str(record.get("issue") or "").strip(),
+        "pages": str(record.get("pages") or "").strip(),
+        "keywords": str(record.get("keywords") or "").strip(),
+        "language": "zh",
+        "score": 0.0,
+        "index": index,
+    }
+
+
+def cnki_rows(records: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Render either raw export records or converted candidates."""
+    rows = []
+    for record in records[: max(0, limit)]:
+        year = str(record.get("year") or "") or str(record.get("published") or "")[:4]
+        venue = str(record.get("journal") or "") or str(record.get("venue") or "")
+        rows.append(
+            {
+                "title": record["title"],
+                "year": year,
+                "venue": venue,
+                "authors": record.get("authors") or [],
+                "doi": record.get("doi") or "",
+            }
+        )
+    return rows
+
+
+def cmd_cnki_search(args: argparse.Namespace) -> None:
+    queries = [part.strip() for part in args.query if part and part.strip()]
+    if not queries:
+        exit_with("Provide at least one query")
+    links = [
+        {
+            "query": query,
+            "url": cnki_search_url(
+                query, field=args.field, journals_only=args.journals_only
+            ),
+        }
+        for query in queries
+    ]
+    payload = {
+        "links": links,
+        "advanced": CNKI_ADVANCED_URL,
+        "hint": CNKI_EXPORT_HINT,
+    }
+    if args.open:
+        for link in links:
+            open_in_browser(link["url"])
+    if args.json:
+        dump_json(payload)
+        return
+    for link in links:
+        print(f"{link['query']} -> {link['url']}")
+    print(f"高级检索: {CNKI_ADVANCED_URL}")
+    print(CNKI_EXPORT_HINT)
+
+
+def cmd_cnki_import(args: argparse.Namespace) -> None:
+    text = read_text_file(args.file)
+    fmt, records = cnki_records(text)
+    if not records:
+        exit_with("导出文件里没有解析到条目；确认导出格式是否为 RefWorks / EndNote。")
+    candidates: list[dict[str, Any]] = []
+    skipped = {"duplicate": 0, "in_library": 0}
+    seen: set[str] = set()
+    api_up = request("/api/", timeout=2).ok
+    for index, record in enumerate(records):
+        candidate = cnki_candidate(record, index)
+        if not candidate["title"]:
+            continue
+        key = candidate["doi"] or normalize_text(candidate["title"])
+        if key in seen:
+            skipped["duplicate"] += 1
+            continue
+        seen.add(key)
+        if (
+            api_up
+            and not args.force
+            and library_has_item(candidate["title"], candidate["doi"])
+        ):
+            skipped["in_library"] += 1
+            continue
+        candidates.append(candidate)
+    limit = clamp_int(args.limit, 1, 500, 200)
+    selected = candidates[:limit]
+    payload = {
+        "format": fmt,
+        "records": len(records),
+        "kept": len(selected),
+        "skipped": skipped,
+        "items": cnki_rows(selected, limit),
+    }
+    if args.bib:
+        text_out = "\n\n".join(
+            build_bibtex_entry(row, i) for i, row in enumerate(selected)
+        )
+        write_text_output(text_out + ("\n" if text_out else ""), args.bib)
+    if args.dry_run or not selected:
+        if args.json:
+            dump_json(payload)
+            return
+        print(f"{fmt} 导出：{len(records)} 条，可导入 {len(selected)} 条（去重 {skipped['duplicate']}，已在库 {skipped['in_library']}）")
+        for index, row in enumerate(payload["items"], start=1):
+            print(f"{index:2}. {row['year']} {row['title'][:80]} | {row['venue']}")
+        print("确认后加 --yes 导入。")
+        return
+    ensure_yes(args, "import CNKI export records into Zotero")
+    result = import_candidates(selected)
+    payload["import"] = result
+    if args.json:
+        dump_json(payload)
+        return
+    print(f"已从 {fmt} 导出导入 {len(selected)} 条：{json.dumps(result, ensure_ascii=False)}")
+
+
+
 def default_window(args: argparse.Namespace) -> tuple[str, str]:
     today = date.today()
     end = args.date_to or today.isoformat()
@@ -1943,12 +2359,14 @@ def cmd_find(args: argparse.Namespace) -> None:
     if not queries:
         exit_with("Provide at least one query")
 
+    sources = tuple(args.source or ["openalex"])
     candidates = gather_candidates(
         queries,
         start,
         end,
         include_preprints=args.include_preprints or args.work_type == "preprint",
         mailto=args.mailto,
+        sources=sources,
     )
     api_up = request("/api/", timeout=2).ok
     kept: list[dict[str, Any]] = []
@@ -1996,7 +2414,7 @@ def cmd_find(args: argparse.Namespace) -> None:
         dump_json(payload["results"] if args.out or args.bib else payload)
         return
     print(
-        f"{len(candidates)} candidates from OpenAlex, kept {len(rows)} "
+        f"{len(candidates)} candidates from {'+'.join(sources)}, kept {len(rows)} "
         f"({skipped['in_library']} already in library, {skipped['low_score']} below score)"
     )
     print_candidates(rows)
@@ -3596,8 +4014,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--import", dest="do_import", action="store_true", help="Import results via Connector"
     )
     find_cmd.add_argument("--yes", action="store_true")
+    find_cmd.add_argument(
+        "--source",
+        action="append",
+        choices=["openalex", "crossref"],
+        help="Metadata source; repeat to merge (openalex keeps its venue metric)",
+    )
     add_json_flag(find_cmd)
     find_cmd.set_defaults(func=cmd_find)
+
+    cnki_search = subcommands.add_parser(
+        "cnki-search",
+        help="Build CNKI search links (CNKI has no public API; nothing is scraped)",
+    )
+    cnki_search.add_argument("query", nargs="+", help="One or more Chinese queries")
+    cnki_search.add_argument("--field", default="主题", help="主题 / 篇名 / 关键词 / 摘要 / 作者 / 全文")
+    cnki_search.add_argument(
+        "--all-sources", dest="journals_only", action="store_false", help="Search every CNKI database"
+    )
+    cnki_search.add_argument("--open", action="store_true", help="Open the links in the default browser")
+    add_json_flag(cnki_search)
+    cnki_search.set_defaults(func=cmd_cnki_search)
+
+    cnki_import = subcommands.add_parser(
+        "cnki-import",
+        help="Import a CNKI export file (RefWorks / EndNote / NoteExpress) into Zotero",
+    )
+    cnki_import.add_argument("--file", required=True, help="Exported .txt from CNKI")
+    cnki_import.add_argument("--limit", type=int, default=200, help="Import at most N records")
+    cnki_import.add_argument("--force", action="store_true", help="Keep records already in the library")
+    cnki_import.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    cnki_import.add_argument("--bib", help="Write the parsed records as BibTeX")
+    cnki_import.add_argument("--yes", action="store_true", help="Confirm the Zotero import")
+    add_json_flag(cnki_import)
+    cnki_import.set_defaults(func=cmd_cnki_import)
 
     frontier = subcommands.add_parser(
         "frontier", help="Track research fronts with saved watches"
@@ -3732,6 +4182,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_flag(gaps)
     gaps.set_defaults(func=cmd_gaps)
 
+    # Lazy optional reading workflow; existing metadata commands stay stdlib-only.
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from paper_reader.cli import register
+    register(subcommands, sys.modules[__name__])
     return parser
 
 

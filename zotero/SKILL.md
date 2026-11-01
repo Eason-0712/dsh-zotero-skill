@@ -1,6 +1,6 @@
 ---
 name: zotero
-description: 面向科研文献全流程的 Zotero 技能：找文献、追前沿、筛核心论文、管理文献（打标签/归集/查重）、批量阅读、分类整理、提炼脉络、发现空白，并支持导出 BibTeX 与给 LaTeX/Markdown 草稿插入引用。用户提到 Zotero、找文献、查文献、前沿、综述、批量读论文、文献整理或研究空白时使用。
+description: 面向不同研究领域的 Zotero 技能：原文定位问答、全文翻译与精读、原生高亮和中文批注、双语 PDF/逐段 Markdown、论文证据对比表、综述与引用追踪；支持 OpenAlex / Crossref / 知网导出文件三种文献来源，术语和数字复核、可追溯纠错，另有归集分类、BibTeX 和草稿引用。用户提到 Zotero、解释论文、翻译、精读、标注、文献比较、综述、中文文献或知网时使用。
 ---
 
 # Zotero · DeepSeek Harness
@@ -9,7 +9,7 @@ description: 面向科研文献全流程的 Zotero 技能：找文献、追前�
 
 ## 定位与运行
 
-以 Harness 加载本 skill 返回的资源目录为 `<skill-dir>`，不是当前工作目录。入口为 `scripts/zotero.py`，Python 3.10+，仅依赖标准库。
+以 Harness 加载本 skill 返回的资源目录为 `<skill-dir>`，不是当前工作目录。基础命令入口为 `scripts/zotero.py`，Python 3.10+，仅依赖标准库。全文工作流可用 `scripts/reader-runner.mjs` 自动准备所需本地组件。
 
 - Windows：先检查 `py -3 --version`；不可用时检查 `python --version`。不要假定存在 `python3`。
 - macOS / Linux：通常使用 `python3`。
@@ -26,6 +26,20 @@ description: 面向科研文献全流程的 Zotero 技能：找文献、追前�
 
 ## 八项能力
 
+## 全文翻译、精读、标注与综述（优先入口）
+
+用户要求全文翻译、深入阅读、重点高亮、双语 PDF、多篇比较或综述时，先读取
+[references/reading-workflow.md](references/reading-workflow.md)。先展示本次输出、深度、版式、优先内容和执行方式，允许保存设置。
+用户只问具体段落、公式、已有批注或要求证据对比表时，按需读 [references/focused-reading.md](references/focused-reading.md)，只检索所需片段、复用已读成果，展示本次任务必要的选项。不要为一个局部问题默认重新生成全文译文、询问全部导出选项。
+使用宿主当前模型生成，一份分析与译文复用于 Markdown、Zotero 笔记和 PDF；默认省用量，用户可选继承当前模型配置的受限并行。
+通过 `read prepare/accept/status/export/publish` 建立可恢复、可定位到原文的阅读任务；多篇综述用 `review prepare/render/search`，材料不足时明确不足并自动搜索带理由的补充候选。
+运行入口为技能资源目录内 `scripts/reader-runner.mjs`（Node 20+），包安装也提供 `lib/reader-runner.js`；首次按需准备本地 Python/PDF/OCR 组件，现有 Python CLI 也保留。
+当前选中论文需安装包内配套 Zotero 扩展；分类、标签、检索和明确 item key 继续使用已有 API。
+不把元数据模板当成精读结论，不把局部语料统计当成已证明的研究空白，不承诺未经实测的完成时间。
+本插件复用 DSH 对话和 Zotero 原生阅读器，不启动独立应用、前端或后台服务。用户评论是阅读线索，论文文本才是事实依据；普通引用关系不能自动标成支持/反驳。
+
+以下命令仍可用于基础查询、归集和统计；`digest` 是阅读包生成器。
+
 ### 1. 找文献 `find`
 
 从 OpenAlex 检索，按期刊影响、年化引用、相关度、新鲜度打分，并与本地库去重。
@@ -33,10 +47,29 @@ description: 面向科研文献全流程的 Zotero 技能：找文献、追前�
 ```text
 <python> "<skill-dir>/scripts/zotero.py" find "knowledge distillation motor imagery" --days 730 --limit 15
 <python> "<skill-dir>/scripts/zotero.py" find "bin picking 6d pose" --days 365 --oa-only --json --out find.json
+<python> "<skill-dir>/scripts/zotero.py" find "grasp detection" --source crossref --days 365 --limit 10
 ```
 
 - 分数是启发式排序信号（期刊 2 年平均被引 + 引用速度 + 相关度 + 新鲜度），不是 JCR 影响因子。
 - `--json` 输出可交给 `screen` 或 `import`；`--oa-only` 只留开放获取。
+- `--source crossref` 换用 Crossref 元数据（覆盖中文期刊与其他带 DOI 的刊物）；Crossref 没有期刊指标与相关度分，排序只靠引用数与新鲜度，所以与 OpenAlex 的分数不能直接横比。
+
+### 1b. 中文文献：知网 `cnki-search` / `cnki-import`
+
+知网（CNKI）**没有公开检索 API**，本技能也不抓取它（会触发反爬且违反条款）。做法是：生成检索链接给用户，由用户导出官方的 RefWorks / EndNote 文件，再由技能解析入库。
+
+```text
+<python> "<skill-dir>/scripts/zotero.py" cnki-search "运动想象 脑电解码" --json
+<python> "<skill-dir>/scripts/zotero.py" cnki-search "遮挡 抓取检测" --field 篇名 --open
+<python> "<skill-dir>/scripts/zotero.py" cnki-import --file 知网导出.txt --dry-run
+<python> "<skill-dir>/scripts/zotero.py" cnki-import --file 知网导出.txt --yes
+```
+
+- `cnki-search` 默认只打印链接（`--open` 才打开浏览器）；`--field` 支持 主题 / 篇名 / 关键词 / 摘要 / 作者 / 全文。
+- `cnki-import` 自动识别 RefWorks 与 EndNote/NoteExpress 两种标签格式，按 DOI 与标题去重，已在库的默认跳过（`--force` 覆盖）。
+- 中文条目会写入 `volume`、`number`、`pages`、`language = {zh}` 与 `keywords`，BibTeX key 用 `cn` 前缀保证 ASCII 可编译。
+- 需要 DOI 与引用量时用 `find --source crossref`；中文期刊的知网被引数没有公开接口，不在技能范围内。
+
 
 ### 2. 追前沿 `frontier`
 
