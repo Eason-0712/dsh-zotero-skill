@@ -14,16 +14,49 @@ def component(name="pdf"):
     raise SystemExit(f"READER_COMPONENT_REQUIRED:{name}")
 
 
-def font_name():
-    """Embed a cached OFL font so Chinese PDF output is portable."""
+# A system CJK face keeps bilingual PDFs working when the pinned OFL download is blocked
+# (raw.githubusercontent.com is unreachable from some networks).
+SYSTEM_FONTS = (
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\msyhl.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+    r"C:\Windows\Fonts\simsun.ttc",
+    r"C:\Windows\Fonts\NotoSansCJK-Regular.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Supplemental/Songti.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+)
+
+
+def font_file():
+    """Explicit override, then the bundled copy, then any system CJK face."""
     import os
+    from .storage import root
+    override = os.environ.get("DSH_READER_FONT")
+    if override:
+        return Path(override)
+    cached = root() / "reader-runtime/fonts/NotoSansSC-Regular.ttf"
+    if cached.is_file():
+        return cached
+    for candidate in SYSTEM_FONTS:
+        path = Path(candidate)
+        if path.is_file():
+            return path
+    return None
+
+
+def font_name():
+    """Embed a CJK font so bilingual PDF output is portable."""
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-    from .storage import root
-    path = Path(os.environ.get("DSH_READER_FONT", root() / "reader-runtime/fonts/NotoSansSC-Regular.ttf"))
-    if not path.is_file():
+    path = font_file()
+    if path is None:
         component("font")
-    name = "DSHReaderNotoSC"
+    name = "DSHReaderCJK"
     if name not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(TTFont(name, str(path)))
     return name

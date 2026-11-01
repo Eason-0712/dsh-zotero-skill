@@ -351,4 +351,39 @@ class ReadingToolsTests(unittest.TestCase):
         self.assertIn('zotero://open-pdf/', text)
 
 
+class FontFallbackTests(unittest.TestCase):
+    """A blocked font download must degrade to a system face instead of failing."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        environment = patch.dict(os.environ, {'ZOTERO_SKILL_CONFIG_DIR': str(self.root / 'state')})
+        environment.start(); self.addCleanup(environment.stop)
+        os.environ.pop('DSH_READER_FONT', None)
+
+    def test_explicit_override_wins(self):
+        target = self.root / 'custom.ttf'; target.write_bytes(b'font')
+        with patch.dict(os.environ, {'DSH_READER_FONT': str(target)}):
+            self.assertEqual(pdf.font_file(), target)
+
+    def test_bundled_copy_beats_system_faces(self):
+        cached = s.root() / 'reader-runtime/fonts'
+        cached.mkdir(parents=True, exist_ok=True)
+        bundled = cached / 'NotoSansSC-Regular.ttf'; bundled.write_bytes(b'font')
+        self.assertEqual(pdf.font_file(), bundled)
+
+    def test_system_face_is_used_when_the_download_was_blocked(self):
+        system = self.root / 'SimHei.ttf'; system.write_bytes(b'font')
+        with patch.object(pdf, 'SYSTEM_FONTS', (str(self.root / 'missing.ttf'), str(system))):
+            self.assertEqual(pdf.font_file(), system)
+
+    def test_nothing_available_requests_the_component(self):
+        with patch.object(pdf, 'SYSTEM_FONTS', (str(self.root / 'missing.ttf'),)):
+            self.assertIsNone(pdf.font_file())
+            with self.assertRaises(SystemExit) as raised:
+                pdf.font_name()
+        self.assertEqual(str(raised.exception), 'READER_COMPONENT_REQUIRED:font')
+
+
 if __name__ == '__main__': unittest.main()

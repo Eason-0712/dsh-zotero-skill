@@ -5,13 +5,29 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import vm from 'node:vm';
-import { componentPlan, uvAsset, downloadVerified } from '../lib/reader-runner.js';
+import { componentPlan, uvAsset, downloadVerified, pipIndexes, pythonCandidates } from '../lib/reader-runner.js';
 
 test('component bootstrap uses pinned digests and rejects arbitrary install names', () => {
   assert.match(uvAsset('win32', 'x64').sha256, /^[a-f0-9]{64}$/);
   assert.match(uvAsset('win32', 'x64').url, /releases\/download\/0\.9\.7/);
   assert.throws(() => componentPlan('untrusted-pip-argument'));
   assert.throws(() => uvAsset('unknown', 'unknown'));
+});
+
+test('package indexes stay ordered and configurable for restricted networks', () => {
+  assert.equal(pipIndexes({})[0], 'https://pypi.org/simple');
+  assert.ok(pipIndexes({}).includes('https://mirrors.aliyun.com/pypi/simple'));
+  assert.deepEqual(pipIndexes({ DSH_READER_PYPI_INDEX: 'https://mirror.example/simple' }), ['https://mirror.example/simple']);
+  assert.deepEqual(pipIndexes({ DSH_READER_PYPI_INDEX: 'https://a.example/simple, https://b.example/simple' }),
+    ['https://a.example/simple', 'https://b.example/simple']);
+});
+
+test('runtime fallback probes the platform interpreters and honours an explicit one', () => {
+  assert.equal(pythonCandidates({}, 'win32')[0].command, 'py');
+  assert.deepEqual(pythonCandidates({}, 'win32')[0].prefix, ['-3']);
+  assert.equal(pythonCandidates({}, 'linux')[0].command, 'python3');
+  assert.deepEqual(pythonCandidates({ DSH_READER_PYTHON: 'C:/Python312/python.exe' }, 'win32'),
+    [{ command: 'C:/Python312/python.exe', prefix: [] }]);
 });
 
 test('checksum failure leaves no executable or partial archive', async () => {

@@ -11,6 +11,7 @@
   "files": [
     "lib/**/*.js",
     "zotero/**",
+    "docs/**",
     "!**/__pycache__/**",
     "!**/*.pyc",
     "cordis.patch.yml",

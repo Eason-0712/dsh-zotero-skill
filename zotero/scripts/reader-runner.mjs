@@ -28,6 +28,43 @@ const FONT = {
   name: 'NotoSansSC-VF.ttf', sha256: 'd68bafcb48a2707749396aa12bbbd833cb70401f3a9a689fd2902c7e0d295964',
   url: 'https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/Variable/TTF/Subset/NotoSansSC-VF.ttf',
 };
+// Package indexes are tried in order; the first entry is the configured/official one.
+const PYPI_INDEXES = ['https://pypi.org/simple', 'https://mirrors.aliyun.com/pypi/simple'];
+const INSTANCE_FONT = 'import sys; from fontTools.ttLib import TTFont; from fontTools.varLib.instancer import instantiateVariableFont; f=TTFont(sys.argv[1]); instantiateVariableFont(f,{"wght":400},inplace=True); f.save(sys.argv[2])';
+
+/** Mirrors are a deployment choice, not a code constant: DSH_READER_PYPI_INDEX wins when set. */
+export function pipIndexes(env = process.env) {
+  const configured = String(env.DSH_READER_PYPI_INDEX || '').split(/[\s,]+/).filter(Boolean);
+  return configured.length ? configured : [...PYPI_INDEXES];
+}
+
+/** Python interpreters to probe when the pinned uv download is unreachable. */
+export function pythonCandidates(env = process.env, platform = process.platform) {
+  const configured = String(env.DSH_READER_PYTHON || '').trim();
+  if (configured) return [{ command: configured, prefix: [] }];
+  const names = platform === 'win32'
+    ? [['py', ['-3']], ['python', []], ['python3', []]]
+    : [['python3', []], ['python', []]];
+  return names.map(([command, prefix]) => ({ command, prefix }));
+}
+
+function probePython(candidate) {
+  const result = spawnSync(candidate.command, [...candidate.prefix, '-c', 'import sys;print("%d.%d" % sys.version_info[:2])'],
+    { encoding: 'utf8', windowsHide: true, timeout: 20_000 });
+  if (result.status !== 0) return null;
+  const match = /^(\d+)\.(\d+)$/.exec(String(result.stdout || '').trim());
+  if (!match) return null;
+  return Number(match[1]) === 3 && Number(match[2]) >= 10 ? { ...candidate, version: `${match[1]}.${match[2]}` } : null;
+}
+
+/** First usable Python 3.10+ interpreter; the skill already needs one to run zotero.py. */
+export function findSystemPython(env = process.env, platform = process.platform) {
+  for (const candidate of pythonCandidates(env, platform)) {
+    const found = probePython(candidate);
+    if (found) return found;
+  }
+  return null;
+}
 
 export function componentPlan(name) {
   if (!Object.hasOwn(COMPONENTS, name)) throw new Error(`Unknown component: ${name}`);
@@ -99,30 +136,67 @@ async function setupLock(directory, callback) {
   try { return await callback(); } finally { rmSync(lock, { recursive: true, force: true }); }
 }
 
+async function ensureUv(directory) {
+  const asset = uvAsset();
+  const uvDir = join(directory, `uv-${UV_VERSION}`);
+  const binary = process.platform === 'win32' ? 'uv.exe' : 'uv';
+  const uv = join(uvDir, binary);
+  if (existsSync(uv)) return uv;
+  mkdirSync(uvDir, { recursive: true });
+  const archive = join(directory, asset.name);
+  await downloadVerified(asset, archive);
+  // Windows ships bsdtar (ZIP supported); Unix tar reads the official tarball.
+  await run('tar', ['-xf', archive, '-C', uvDir, ...(asset.name.endsWith('.zip') ? [] : ['--strip-components=1', '--no-same-owner'])]);
+  rmSync(archive, { force: true });
+  if (!existsSync(uv)) throw new Error('Archive did not contain the expected uv binary');
+  return uv;
+}
+
 async function runtime(directory) {
   return setupLock(directory, async () => {
     const python = join(directory, 'venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-    const asset = uvAsset();
-    const uvDir = join(directory, `uv-${UV_VERSION}`);
-    const binary = process.platform === 'win32' ? 'uv.exe' : 'uv';
-    const uv = join(uvDir, binary);
-    if (!existsSync(uv)) {
-      mkdirSync(uvDir, { recursive: true });
-      const archive = join(directory, asset.name);
-      await downloadVerified(asset, archive);
-      // Windows ships bsdtar (ZIP supported); Unix tar reads the official tarball.
-      await run('tar', ['-xf', archive, '-C', uvDir, ...(asset.name.endsWith('.zip') ? [] : ['--strip-components=1', '--no-same-owner'])]);
-      rmSync(archive, { force: true });
-      if (!existsSync(uv)) throw new Error('Archive did not contain the expected uv binary');
+    let uv = null;
+    try {
+      uv = await ensureUv(directory);
+    } catch (error) {
+      // A blocked download must not end the feature: fall back to the system interpreter.
+      process.stderr.write(`Managed uv unavailable (${error.message}); falling back to the system Python.\n`);
     }
     if (!existsSync(python)) {
-      process.stderr.write('Preparing a private Python 3.12 environment (first run only)...\n');
-      await run(uv, ['--no-config', 'venv', '--python', '3.12', join(directory, 'venv')], {
-        env: { ...process.env, UV_PYTHON_INSTALL_DIR: join(directory, 'python'), UV_PYTHON_DOWNLOADS: 'automatic' },
-      });
+      if (uv) {
+        process.stderr.write('Preparing a private Python 3.12 environment (first run only)...\n');
+        await run(uv, ['--no-config', 'venv', '--python', '3.12', join(directory, 'venv')], {
+          env: { ...process.env, UV_PYTHON_INSTALL_DIR: join(directory, 'python'), UV_PYTHON_DOWNLOADS: 'automatic' },
+        });
+      } else {
+        const system = findSystemPython();
+        if (!system) {
+          throw new Error('Cannot prepare the reader runtime: the uv download failed and no Python 3.10+ was found. '
+            + 'Install Python 3.10+ (or point DSH_READER_PYTHON at one) and retry.');
+        }
+        process.stderr.write(`Preparing a private Python ${system.version} environment with ${system.command}...\n`);
+        await run(system.command, [...system.prefix, '-m', 'venv', join(directory, 'venv')]);
+      }
     }
     return { python, uv };
   });
+}
+
+async function pipInstall(runtime, packages) {
+  const base = runtime.uv
+    ? { command: runtime.uv, args: ['--no-config', 'pip', 'install', '--python', runtime.python] }
+    : { command: runtime.python, args: ['-m', 'pip', 'install'] };
+  let failure = null;
+  for (const index of pipIndexes()) {
+    try {
+      await run(base.command, [...base.args, '--only-binary', ':all:', '--index-url', index, ...packages], { filterLegacyWarnings: true });
+      return index;
+    } catch (error) {
+      failure = error;
+      process.stderr.write(`Package index ${index} failed; trying the next one.\n`);
+    }
+  }
+  throw failure || new Error('No package index configured');
 }
 
 async function install(directory, runtime, name) {
@@ -132,16 +206,26 @@ async function install(directory, runtime, name) {
     const receipt = join(directory, `${name}.json`);
     if (existsSync(receipt) && JSON.parse(readFileSync(receipt, 'utf8')).identity === identity) return;
     process.stderr.write(`Preparing ${name} components (first use; progress follows)...\n`);
-    await run(runtime.uv, ['--no-config', 'pip', 'install', '--python', runtime.python, '--only-binary', ':all:', '--index-url', 'https://pypi.org/simple', ...packages], { filterLegacyWarnings: true });
+    await pipInstall(runtime, packages);
+    let fontSource = 'bundled';
     if (name === 'font') {
       const fonts = join(directory, 'fonts');
       mkdirSync(fonts, { recursive: true });
       const source = join(fonts, FONT.name);
-      await downloadVerified(FONT, source);
-      await run(runtime.python, ['-c', 'import sys; from fontTools.ttLib import TTFont; from fontTools.varLib.instancer import instantiateVariableFont; f=TTFont(sys.argv[1]); instantiateVariableFont(f,{"wght":400},inplace=True); f.save(sys.argv[2])', source, join(fonts, 'NotoSansSC-Regular.ttf')]);
-      rmSync(source, { force: true });
+      try {
+        await downloadVerified(FONT, source);
+        await run(runtime.python, ['-c', INSTANCE_FONT, source, join(fonts, 'NotoSansSC-Regular.ttf')]);
+      } catch (error) {
+        // Restricted networks cannot reach the pinned font host; pdf.font_file() then picks a
+        // system CJK face, so the feature still works instead of failing at first use.
+        fontSource = 'system';
+        writeFileSync(join(fonts, 'font-fallback.json'), JSON.stringify({ reason: error.message, at: new Date().toISOString() }));
+        process.stderr.write(`Bundled font unavailable (${error.message}); using a system CJK font instead.\n`);
+      } finally {
+        rmSync(source, { force: true });
+      }
     }
-    writeFileSync(receipt, JSON.stringify({ identity, packages }));
+    writeFileSync(receipt, JSON.stringify({ identity, packages, font: fontSource }));
   });
 }
 

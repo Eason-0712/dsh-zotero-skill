@@ -72,9 +72,12 @@ def local_pdf(api, entry, attachment_key=None):
         url = urllib.parse.urlparse(str(raw).strip())
         if url.scheme != "file" or url.netloc not in {"", "localhost"}:
             continue
-        path = Path(urllib.parse.unquote(url.path))
-        if sys.platform == "win32" and re.match(r"^/[A-Za-z]:", str(path)):
-            path = Path(str(path)[1:])
+        # The URL path keeps its forward slashes; WindowsPath would render them as
+        # backslashes, so the drive-letter strip must run on the URL string.
+        raw_path = urllib.parse.unquote(url.path)
+        if sys.platform == "win32" and re.match(r"^/[A-Za-z]:", raw_path):
+            raw_path = raw_path[1:]
+        path = Path(raw_path)
         if path.is_file():
             candidates.append((path.stat().st_size, akey, path))
     if not candidates:
