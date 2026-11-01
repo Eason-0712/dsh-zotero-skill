@@ -268,7 +268,10 @@ def commit_results(directory, payload, previous, reason):
 def history(job_id):
     directory, _ = load(job_id)
     store = result_store(directory)
-    revision = result_revision(directory)
+    # Walk the accepted snapshots only: pending chunk rows are merged by aggregate()
+    # but are not revisions, so starting from result_revision() would look for a
+    # history file that does not exist and return an empty chain.
+    revision = base_revision(directory)
     result, visited = [], set()
     while revision not in visited:
         visited.add(revision)

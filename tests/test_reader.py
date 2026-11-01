@@ -142,6 +142,20 @@ class ReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Conflicting translations'):
             jobs.aggregate(directory)
 
+    def test_history_still_walks_accepted_snapshots_with_pending_chunks(self):
+        job_id = self.prepare()['id']
+        directory, manifest = jobs.load(job_id)
+        document = s.read(manifest['document'])
+        blocks = [b for b in document['blocks'] if b['translate']]
+        jobs.accept(job_id, dict(self.full_result(job_id), translations=[{'block_id': blocks[0]['id'], 'text': '已接受的第一段译文，用于历史链检查。'}], claims=[]))
+        self.assertEqual(len(jobs.history(job_id)), 1)
+        store = jobs.result_store(directory)
+        s.write(store / 't-0001.json', {'source_hash': manifest['source_hash'],
+                                        'translations': [{'block_id': block['id'], 'text': f'未接受的第 {index} 段译文，只出现在合并结果里。'} for index, block in enumerate(blocks[1:], 2)],
+                                        'claims': [], 'missing': {}})
+        # Pending chunks are not revisions: the chain still shows the accepted snapshot.
+        self.assertEqual(len(jobs.history(job_id)), 1)
+
     def test_partial_results_resume_and_conflicts_are_not_overwritten(self):
         job_id = self.prepare()['id']
         result = self.full_result(job_id)
