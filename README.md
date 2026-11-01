@@ -69,7 +69,8 @@ node lib/reader-runner.js read publish read-JOBID --yes
 
 ### 既有文献工作流
 
-- **找文献**：从 OpenAlex 按主题检索，按期刊影响力、引用速度、相关度、新鲜度排序，并与本地库去重。
+- **找文献**：从 OpenAlex 按主题检索，按期刊影响力、引用速度、相关度、新鲜度排序，并与本地库去重；`--source crossref` 可换用 Crossref 元数据。
+- **中文文献**：知网没有公开检索 API，所以技能生成检索链接、解析你从知网导出的 RefWorks / EndNote 文件再入库，中文条目保留卷期页、关键词与 `language=zh`，BibTeX 键仍是纯 ASCII。
 - **追前沿**：把常读方向存成 watch，每次只拉「上次运行以来」的新论文，不重复推送。
 - **筛核心论文**：把候选或库内条目分成 核心 / 重要 / 参考 三档，输出可复制的短名单。
 - **管理文献**：批量打标签、归集到分类、按 DOI / 标题查重并清理副本。
@@ -240,7 +241,9 @@ python zotero/scripts/zotero.py daily-schedule --remove
 | --- | --- |
 | `status` | 检查本地 API、Connector、版本 |
 | `authorize` | 取得本地 API 写权限（Zotero 弹窗点「Always Allow」） |
-| `find <query>` | OpenAlex 检索并按分数排序，`--oa-only` / `--json` / `--out` |
+| `find <query>` | OpenAlex 检索并按分数排序，`--oa-only` / `--json` / `--out` / `--source crossref` |
+| `cnki-search <query...>` | 生成知网检索链接（知网无公开 API，不抓取），`--field` / `--open` / `--json` |
+| `cnki-import --file` | 解析知网导出的 RefWorks / EndNote 文件并入 Zotero，`--dry-run` / `--bib` / `--yes` |
 | `frontier add\|run\|list\|remove` | 保存研究方向，只拉上次之后的新论文 |
 | `screen` | 把候选或库内条目分成 核心 / 重要 / 参考 |
 | `tag` | 批量加 / 删 / 替换标签（`--dry-run`） |
