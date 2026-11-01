@@ -59,7 +59,7 @@ def plan(job_id):
             meta = document["pages"][block["page"] - 1]
             boxes = pdf.quote_boxes(block, ref["quote"])
             rects = original_rects(reader.pages[block["page"] - 1], meta, boxes)
-            items.append({"key": key, "itemType": "annotation", "parentItem": manifest["attachment_key"],
+            items.append({"key": key, "version": 0, "itemType": "annotation", "parentItem": manifest["attachment_key"],
                           "annotationType": "highlight", "annotationText": escape(ref["quote"]),
                           "annotationComment": escape(f"[{jobs.KIND_LABELS[claim['kind']]}] {claim['statement']}"),
                           "annotationColor": "#" + pdf.COLORS.get(claim["category"], "FFE066").lower(),

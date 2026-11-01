@@ -248,6 +248,14 @@ class ReadingToolsTests(unittest.TestCase):
         self.assertTrue(680 < position['rects'][0][3] < 725)
         self.assertEqual(item['annotationText'], self.block['text'])
 
+    def test_native_payload_creates_items_without_a_prior_version(self):
+        self.accept()
+        _, items = native.plan(self.job)
+        self.assertTrue(items)
+        # The local API rejects a key-based write with 428 unless the payload
+        # carries an explicit version; new objects start at version 0.
+        self.assertTrue(all(item.get('version') == 0 for item in items))
+
     def test_native_repeat_preserves_user_edited_comment(self):
         self.accept()
         def create(path, values, **kwargs):
