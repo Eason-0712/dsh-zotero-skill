@@ -112,6 +112,18 @@ class CnkiFormatTests(unittest.TestCase):
         self.assertEqual(candidate["number"], "7")
         self.assertEqual(candidate["doi"], "10.11897/sp.j.1016.2023.01201")
 
+    def test_rows_show_year_and_venue_for_raw_and_converted_records(self):
+        record = zotero.parse_refworks(REFWORKS_TEXT)[0]
+        candidate = zotero.cnki_candidate(record)
+        rows = zotero.cnki_rows([record, candidate], 5)
+        self.assertEqual(len(rows), 2)
+        # raw exports carry year/journal, converted candidates carry published/venue
+        self.assertEqual(rows[0]["year"], "2023")
+        self.assertEqual(rows[1]["year"], "2023")
+        self.assertEqual(rows[0]["venue"], "计算机学报")
+        self.assertEqual(rows[1]["venue"], "计算机学报")
+        self.assertEqual(zotero.cnki_rows([record], 0), [])
+
     def test_bibtex_entry_keeps_volume_pages_and_language(self):
         record = zotero.parse_refworks(REFWORKS_TEXT)[0]
         entry = zotero.build_bibtex_entry(zotero.cnki_candidate(record), 0)
